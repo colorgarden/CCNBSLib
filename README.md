@@ -69,26 +69,19 @@ end
 
 ## 安装
 
-用一个命令行安装器（apt 风格）。在电脑上打开 Lua 提示符（输入 `lua`），粘贴：
-
-```lua
-local url = "https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua"
-local r = http.get(url)
-local f = fs.open("install.lua", "w")
-f.write(r.readAll())
-f.close()
-```
-
-然后：
+一条命令：
 
 ```
-install.lua install
+wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
 ```
 
-它会读取文件清单、逐个下载、装到 `/lib/`、显示进度。之后可以
-`install upgrade` 更新、`install remove` 卸载。
+`wget` 是 CraftOS 自带的，它会取回安装器并直接执行，把库装到 `/lib/`。
 
+之后可以 `wget run <地址> upgrade` 更新、`wget run <地址> remove` 卸载。
 完整说明见 [`docs/CLI.md`](docs/CLI.md)。
+
+> 地址里的 `https://gh.llkk.cc/` 是代理前缀，连不上 GitHub 时用它。可换成
+> `https://ghproxy.net/` 或 `https://ghfast.top/`，能直连就整个去掉。
 
 ### 手动安装
 

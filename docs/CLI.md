@@ -6,32 +6,39 @@
 
 ---
 
-## 第一次安装
+## 安装：一条命令
 
-电脑上没有 `wget`，所以第一步要手动把安装器取下来。在电脑上打开 Lua 提示符
-（输入 `lua`），粘贴这几行：
-
-```lua
-local url = "https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua"
-local r = http.get(url)
-local f = fs.open("install.lua", "w")
-f.write(r.readAll())
-f.close()
-```
-
-然后运行：
+在电脑上敲：
 
 ```
-install.lua install
+wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
 ```
 
-它会读取文件清单、逐个下载、装到 `/lib/`，并在屏幕上显示进度。装完就能用了：
+`wget` 是 CraftOS 自带的，它会取回安装器并直接执行，把库装到 `/lib/`，全程显示进度。
+
+装完就能用了：
 
 ```lua
 local ccnbs = require("ccnbslib")
 ```
 
-> 如果你能直连 GitHub，把上面 URL 里的 `https://gh.llkk.cc/` 去掉即可。
+> 连不上 GitHub 时，地址里的 `https://gh.llkk.cc/` 是代理前缀。换成
+> `https://ghproxy.net/` 或 `https://ghfast.top/`，或者（能直连的话）整个去掉。
+
+### 如果 wget 不可用
+
+先存成文件，再运行：
+
+```lua
+local r = http.get("https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua")
+local f = fs.open("install.lua", "w")
+f.write(r.readAll())
+f.close()
+```
+
+```
+install.lua install
+```
 
 ---
 
@@ -57,8 +64,16 @@ install help                 显示用法
 
 | 选项 | 作用 |
 |---|---|
-| `--mirror <名>` | 优先用某个镜像（仍会在它失败时换下一个） |
-| `--debug` | 打印每一步下载到了哪个镜像 |
+| `--mirror <名>` | 优先用某个镜像（失败时仍会换下一个） |
+| `--debug` | 打印每一步用了哪个镜像 |
+
+用 `wget run` 时，命令写在地址后面：
+
+```
+wget run <地址> upgrade
+```
+
+不写命令就是 `install`。
 
 ---
 

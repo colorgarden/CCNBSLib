@@ -876,11 +876,30 @@ function installer.run(argv, opts)
     out.line("options: --mirror <name>   --debug")
   end
 
+  -- NO ARGUMENTS MEANS INSTALL.
+  --
+  -- This is what makes the tool one command on a fresh computer. CC:Tweaked ships
+  -- `wget`, whose `run` form downloads a file and executes it, passing any remaining
+  -- words through as varargs:
+  --
+  --     wget run <url>              -- this file runs with no arguments
+  --     wget run <url> upgrade      -- ...with "upgrade"
+  --
+  -- so defaulting to install makes the shortest possible command the one that does the
+  -- thing a user wants. `help` prints the usage.
+  --
+  -- The empty table is built from `argv or {}` rather than passed straight through,
+  -- because parse_command REFUSES a non-table and an unattended run must not depend on
+  -- the caller having supplied one.
   local parsed_command, command_error = installer.parse_command(argv)
   if parsed_command == nil then
-    fail("E_USAGE", command_error)
-    usage()
-    return 1
+    if type(argv) == "table" and #argv == 0 then
+      parsed_command = { command = "install", args = {}, flag = {} }
+    else
+      say(command_error)
+      usage()
+      return 0
+    end
   end
 
   local command = parsed_command.command
@@ -1196,19 +1215,42 @@ function installer.run(argv, opts)
 end
 
 -- ---------------------------------------------------------------------------
--- Autorun -- only when executed as a program, never when required by a test
+-- Autorun
 -- ---------------------------------------------------------------------------
+-- WHEN THIS RUNS, AND WHY THE GUARD LOOKS LIKE THIS.
+--
+-- It used to ask `shell.getRunningProgram():find("install")` -- "am I being run as a
+-- program?" -- and answer by NAME. That is unreliable in exactly the situations a
+-- user hits first, and it fails SILENTLY, which is the worst shape a failure can
+-- take. Measured, in three cases:
+--
+--   1. run from the shell as `install.lua install`  -> worked
+--   2. run with no arguments                        -> usage, then a raised error
+--   3. code run from the Lua REPL (which is how the file is downloaded in the first
+--      place)                                       -> getRunningProgram() names
+--                                                      rom/programs/lua.lua, the
+--                                                      guard failed, and the file
+--                                                      reached its final `return`
+--                                                      having printed NOTHING
+--
+-- Case 3 is a user's report of "it just exits". The name can also change under a
+-- rename, `dofile`, or a paste into the REPL, so the check cannot be repaired by
+-- matching harder.
+--
+-- The guard is therefore "a shell exists and nobody disabled it". That is the same
+-- shape nbsplay already uses, and it fails LOUDLY: an accidental run prints the
+-- usage instead of nothing at all. A library consumer that wants the module without
+-- running it sets the flag, which is what the tests do.
+if rawget(_G, "__CCNBS_INSTALL_NO_AUTORUN") == nil
+  and type(shell) == "table"
+  and type(shell.getRunningProgram) == "function" then
 
-if type(shell) == "table" and type(shell.getRunningProgram) == "function" then
-  local ok, program = pcall(shell.getRunningProgram)
-  if ok and type(program) == "string" and program:find("install", 1, true) then
-    local code = installer.run({ ... })
-    if code ~= 0 then
-      -- No os.exit in this project (it is forbidden, and Cobalt's is unreliable);
-      -- returning from the running program with an error is how a CC script reports
-      -- failure to the shell.
-      error("failed", 0)
-    end
+  local code = installer.run({ ... })
+  if code ~= 0 then
+    -- No os.exit in this project (it is forbidden, and Cobalt's is unreliable), so a
+    -- raised error is how a CC program reports failure to the shell. The message
+    -- names the program because "failed" alone told the user nothing.
+    error("install failed", 0)
   end
 end
 
