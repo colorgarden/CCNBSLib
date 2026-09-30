@@ -261,10 +261,20 @@ done`.
 * **`tests/` is NOT published** (`.gitignore`). The suite protects the local
   developer only. If a guarantee must hold on GitHub, it cannot live only in
   `tests/`.
-* **Do not add a module without adding it to the file list in `README.md`.** The
-  installer that used to enforce a shipped list is gone, so nothing mechanical
-  checks this now — a module that is not listed simply will not be copied, and the
-  library will be broken for everyone but you.
+* **A SHIPPED MODULE MUST APPEAR IN THE MANIFEST, AND THE MANIFEST IS GENERATED.**
+  `manifest.txt` is the list `install.lua` installs; a module missing from it is
+  simply not installed, and the library is then broken for everyone but you. That is
+  not a thing to remember: `lua tools/make_manifest.lua` derives the manifest from
+  git, and `tests/installer_spec.lua` case 22 fails when the committed manifest is
+  missing a file or disagrees with a size. So:
+  * after adding, renaming or deleting a module — `lua tools/make_manifest.lua`,
+    then commit `manifest.txt` along with the change;
+  * `lua tools/make_manifest.lua --check` exits non-zero when the committed manifest
+    is stale, which is what a CI would run;
+  * the generator REFUSES a commit that is not on `origin/main`. A manifest naming an
+    unpushed commit points every user at a 404, so push first, then regenerate.
+  `README.md`'s file list is still written by hand and still matters for a human
+  reader; the manifest is what the machine uses.
 
 ---
 

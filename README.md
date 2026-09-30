@@ -3,9 +3,9 @@
 在 [CC:Tweaked](https://tweaked.cc/) 电脑上**解析 Note Block Studio `.nbs` 乐谱，
 并可把它调度到 `speaker` 外设上播放**的 Lua 库。
 
-**这是一个库，不是程序。** 仓库里没有界面、没有安装器、没有网络客户端——只有
-「字节 → 乐谱 → 分析 → 事件流 → 扬声器调用」这条流水线，以及一个最小的命令行
-播放器用来示范怎么用它。
+**这是一个库，不是程序。** 仓库里没有界面——只有「字节 → 乐谱 → 分析 → 事件流 →
+扬声器调用」这条流水线，一个最小的命令行播放器用来示范怎么用它，以及一个命令行
+安装器用来把它装到电脑上。
 
 > 版本：`1.0.0`　模块入口：`require("ccnbslib")`
 
@@ -69,7 +69,30 @@ end
 
 ## 安装
 
-没有安装器。把这些文件按原目录结构复制到电脑的 `/lib/`：
+用一个命令行安装器（apt 风格）。在电脑上打开 Lua 提示符（输入 `lua`），粘贴：
+
+```lua
+local url = "https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua"
+local r = http.get(url)
+local f = fs.open("install.lua", "w")
+f.write(r.readAll())
+f.close()
+```
+
+然后：
+
+```
+install.lua install
+```
+
+它会读取文件清单、逐个下载、装到 `/lib/`、显示进度。之后可以
+`install upgrade` 更新、`install remove` 卸载。
+
+完整说明见 [`docs/CLI.md`](docs/CLI.md)。
+
+### 手动安装
+
+不用安装器也行，把这 20 个文件按原目录结构复制到电脑的 `/lib/`：
 
 ```text
 /lib/ccnbslib.lua         （库入口）
@@ -234,6 +257,7 @@ local shown = ccnbs.cp1252.to_display(song.header.name)
 
 | 文件 | 用途 |
 |---|---|
+| [`docs/CLI.md`](docs/CLI.md) | 安装器用法：命令、镜像、出错码、更新与卸载 |
 | [`docs/API.md`](docs/API.md) | 公共 API 参考：接缝注入、返回值形状、错误码 |
 | [`docs/COMPAT.md`](docs/COMPAT.md) | 平台差异：音高、每 tick 音符数、定时粒度 |
 
