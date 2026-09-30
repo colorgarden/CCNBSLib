@@ -63,8 +63,7 @@ end
 - **CraftOS-PC 模拟器**：`<用户数据目录>/config/global.json` 里的 `http_enable`；
 - **真实 CC:Tweaked 服务器**：`computercraft-server.toml` 里的 `http.enabled`。
 
-> 实测本项目使用的 CraftOS-PC 2.8.3 构建**会忽略 `-o` / `--option` 启动参数**，
-> 所以**不要**指望用 `-o http_enable=true` 打开 HTTP——只有改配置文件并重启才有效。
+改完配置需要重启游戏或电脑才生效。
 
 ---
 
@@ -130,19 +129,6 @@ playing [#####-----]  50%  0:41/1:23  note 421/842
 ```text
 nbsplay: E_DECODE: E_TRUNCATED
 ```
-
-> **换行不靠 `term.write("\n")`。** 实测（CraftOS-PC 2.8.3）：`term.write` 既不
-> 解释换行、也不折行——文档原话是它 "does not handle ... line breaks or word
-> wrapping"，源码里它只做
-> `setCursorPos(getCursorX() + text.length(), getCursorY())`。所以写完一行再
-> `write("\n")`，光标只是**右移一格、行号不变**；下一条消息就会盖掉上一条，屏幕
-> 最后只剩最后一行。真正的换行是 `setCursorPos(1, y + 1)`（到底部则
-> `setCursorPos(1, height)` + `scroll(1)`），`bios.lua` 自己的 `write` 就是这么做。
->
-> 实时行的长度**严格小于终端宽度**，但那只是为了避免**被裁掉**：`term.write`
-> 超宽不折行也不报错，`TextBuffer.write` 按边界裁剪，右侧字符直接丢失。所以
-> `cli.progress_line` 宁可依次丢掉时钟、音符计数、进度条，也不让百分比被切掉；
-> 窄到极限时退化成只有一个百分比。
 
 下载阶段按 8 KiB 分块读取，所以百分比是**真实的字节进度**而不是干等；
 播放阶段从库给出的 `t_ms` 计算，因此节拍不均匀的歌也不会让进度条乱跳。
@@ -232,10 +218,11 @@ local shown = ccnbs.cp1252.to_display(song.header.name)
 
 ## 平台差异
 
-[`docs/COMPAT.md`](docs/COMPAT.md) 记录了实测的平台行为差异，其中最重要的一条：
+[`docs/COMPAT.md`](docs/COMPAT.md) 列出与真实游戏不同的平台行为，影响最大的一条是
+扬声器音高：
 
-> **CraftOS-PC 模拟器对 `playNote` 的音高只接受 0..24，越界直接抛错；真实
-> CC:Tweaked 根本不校验音高。** 这是「模拟器比游戏更严」的单侧分歧。
+> **CraftOS-PC 模拟器对 `playNote` 的音高只接受 0..24，越界直接报错；真实
+> CC:Tweaked 不校验音高。** 这是「模拟器比游戏更严」的单侧差异。
 
 因此本库**刻意不夹取音高**：超出原生范围的音符**原样**送进扬声器，最终音色取决于
 客户端安装的扩展音域材质包。模拟器上跑越界音高的歌会报错——那是模拟器的限制，
@@ -248,7 +235,7 @@ local shown = ccnbs.cp1252.to_display(song.header.name)
 | 文件 | 用途 |
 |---|---|
 | [`docs/API.md`](docs/API.md) | 公共 API 参考：接缝注入、返回值形状、错误码 |
-| [`docs/COMPAT.md`](docs/COMPAT.md) | 平台兼容性实测记录与探测方法 |
+| [`docs/COMPAT.md`](docs/COMPAT.md) | 平台差异：音高、每 tick 音符数、定时粒度 |
 
 ---
 

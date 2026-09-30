@@ -292,6 +292,16 @@ done`.
    mattered was minifying the whole tree and passing the whole suite on it.
 7. **Correct yourself in the record.** When a claim in `NOTICE`, a doc or a
    ledger entry turns out false, fix the text — do not leave it standing.
+8. **PUBLISHED DOCS ARE FOR USERS.** Everything committed under `docs/` (and every
+   section of `README.md`) is read by someone who wants to install and play music,
+   so it is written for them: what the thing does, how to run it, what can go
+   wrong, and nothing else. No design rationale, no "measured evidence", no
+   references to this file, no account of the mistakes made along the way.
+   The ONE exception is a document that is explicitly for an agent — this file is
+   the example. Planning artifacts (design specs, work plans, evidence) are agent
+   material and belong in `.omo/`, which `.gitignore` already refuses to publish.
+   This was broken once: a design spec was committed to `docs/superpowers/specs/`
+   and had to be moved out.
 
 ---
 
