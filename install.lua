@@ -122,6 +122,27 @@ local function http_seam()
   return seams.http or raw_global("http")
 end
 
+-- read_seam(): how the installer asks the user a question.
+--
+-- Injected through the seam so a test can answer it; `read` is a CC global, and an
+-- interactive path that was never exercised is exactly how the autorun bug survived
+-- (written, never run, silently wrong). Returns nil when there is no way to read,
+-- which every caller treats as "the user said nothing".
+local function read_seam(prompt)
+  if type(seams.read) == "function" then
+    return seams.read(prompt)
+  end
+  local reader = raw_global("read")
+  if type(reader) ~= "function" then
+    return nil
+  end
+  local ok, answer = pcall(reader, prompt)
+  if not ok then
+    return nil
+  end
+  return answer
+end
+
 -- installer.file_size(path) -> number | nil
 --
 -- Uses the fs seam when there is one, and falls back to plain io so the spec can
@@ -526,6 +547,28 @@ local function fetch(url)
   return body
 end
 
+-- prefer_mirror(mirrors, chosen) -> array with `chosen` first
+--
+-- A mirror that just served the manifest has PROVEN it works, so every later request
+-- should try it before the ones already known to be slow. Without this, each of the
+-- 20 files walks the whole list from the top, and with two dead mirrors ahead of the
+-- good one that is two 30-second http timeouts PER FILE -- twenty minutes of silence
+-- for a reason the installer already knew after the first request.
+--
+-- The rest keep their order, so a mirror that starts failing later is still reachable.
+function installer.prefer_mirror(mirrors, chosen)
+  if type(mirrors) ~= "table" or #mirrors == 0 or type(chosen) ~= "table" then
+    return mirrors
+  end
+  local ordered = { chosen }
+  for index = 1, #mirrors do
+    if mirrors[index] ~= chosen then
+      ordered[#ordered + 1] = mirrors[index]
+    end
+  end
+  return ordered
+end
+
 -- ---------------------------------------------------------------------------
 -- Disk
 -- ---------------------------------------------------------------------------
@@ -644,14 +687,29 @@ local function render_sources(mirrors)
   return table.concat(lines, "\n") .. "\n"
 end
 
+-- copy_mirrors(mirrors) -> a shallow copy of the array
+--
+-- load_mirrors must NEVER hand out installer.DEFAULT_MIRRORS itself. `mirror add`
+-- appends to whatever it is given, so returning the module constant let one command
+-- permanently edit the defaults for the rest of the process -- a second run in the
+-- same process then saw a longer list, and repeated adds accumulated duplicates. A
+-- copy per caller makes the defaults immutable in practice.
+local function copy_mirrors(mirrors)
+  local copy = {}
+  for index = 1, #mirrors do
+    copy[index] = mirrors[index]
+  end
+  return copy
+end
+
 local function load_mirrors()
   local text = read_file(installer.SOURCES_PATH)
   if text == nil then
-    return installer.DEFAULT_MIRRORS
+    return copy_mirrors(installer.DEFAULT_MIRRORS)
   end
   local parsed = parse_sources(text)
   if #parsed == 0 then
-    return installer.DEFAULT_MIRRORS
+    return copy_mirrors(installer.DEFAULT_MIRRORS)
   end
   return parsed
 end
@@ -662,6 +720,85 @@ local function save_mirrors(mirrors)
     return false, "cannot create " .. installer.STATE_DIR
   end
   return write_file(installer.SOURCES_PATH, render_sources(mirrors))
+end
+
+-- select_mirror(mirrors, out, opts) -> mirror | nil, reason
+--
+-- The numbered menu, shared by `install` and `mirror pick` because they differ only
+-- in what a blank answer MEANS:
+--
+--   opts.allow_automatic = true   blank means "use the automatic order" and returns
+--                                 nil without complaint. This is the install path: a
+--                                 user pressing enter wants the install to proceed,
+--                                 not to be cancelled.
+--   opts.allow_automatic = false  blank cancels, and the reason says so. This is
+--                                 `mirror pick`, a command whose entire purpose is to
+--                                 CHANGE the setting, so "change nothing" is a valid
+--                                 outcome that has to be reported.
+--
+-- The chosen mirror is tested before it is returned: an unreachable choice would
+-- otherwise be used for every file and fail twenty times. When the test fails the
+-- reason is returned and the caller decides -- for an install that means carrying on
+-- with the automatic order, which skips dead mirrors anyway.
+local function select_mirror(mirrors, out, opts)
+  opts = type(opts) == "table" and opts or {}
+
+  out.line("")
+  out.line("install: which mirror?")
+  for index = 1, #mirrors do
+    out.line(string.format("install:   %d) %-14s %s", index, mirrors[index].name,
+      mirrors[index].prefix == "" and "(GitHub, no proxy)" or mirrors[index].prefix))
+  end
+  out.line("")
+
+  local prompt
+  if opts.allow_automatic then
+    prompt = "number (blank = try them in order): "
+  else
+    prompt = "number (blank to cancel): "
+  end
+
+  local answer = read_seam(prompt)
+
+  if type(answer) ~= "string" then
+    -- No way to read: not an error, just nothing to ask.
+    return nil, "nothing was read"
+  end
+
+  local trimmed = answer:gsub("%s", "")
+
+  if trimmed == "" then
+    if opts.allow_automatic then
+      return nil, nil
+    end
+    return nil, "cancelled -- nothing changed"
+  end
+
+  local choice = tonumber(trimmed)
+  if choice == nil or choice ~= math.floor(choice)
+    or choice < 1 or choice > #mirrors then
+    if opts.allow_automatic then
+      -- Do not abort an install over a typo; say so and carry on automatically.
+      return nil, "not a listed number, so the automatic order is used"
+    end
+    return nil, "not a listed number, so nothing changed"
+  end
+
+  local chosen = mirrors[choice]
+  out.refresh("testing " .. chosen.name .. " ...")
+  local url = installer.build_url(chosen.prefix, installer.BRANCH, "manifest.txt")
+  local body, reason = fetch(url)
+  out.line("")
+
+  if body == nil then
+    if opts.allow_automatic then
+      return nil, chosen.name .. " did not answer (" .. tostring(reason)
+        .. "), so the automatic order is used"
+    end
+    return nil, chosen.name .. " did not answer: " .. tostring(reason)
+  end
+
+  return chosen, nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -746,6 +883,7 @@ local function download_one(path, mirrors, log)
     local body, reason = fetch(url)
     if body == nil then
       last_reason = mirror.name .. ": " .. tostring(reason)
+      log("  failed: " .. last_reason)
     else
       return body, nil, mirror
     end
@@ -753,18 +891,29 @@ local function download_one(path, mirrors, log)
   return nil, last_reason or "every mirror failed", nil
 end
 
--- manifest_from(mirrors, log) -> parsed | nil, reason
+-- manifest_from(mirrors, log, out) -> parsed | nil, reason, answered_mirror
 --
--- The ONE thing fetched from `main`: the commit to pin is only known after reading
--- the manifest, so it cannot itself be commit-pinned. See the header for why that
--- ordering is fundamental rather than an oversight.
-local function manifest_from(mirrors, log)
+-- FEEDBACK IS NOT OPTIONAL HERE. `http.get` waits up to 30 seconds before it gives up
+-- (DEFAULT_TIMEOUT in HTTPAPI.java, and the host config can raise it), so trying four
+-- mirrors in silence can leave the screen frozen for two minutes. A user cannot tell
+-- that from a crash, and the natural response is to hit Ctrl+T. So every attempt is
+-- announced on ONE refreshed line -- which mirror, which number, and how it ended.
+--
+-- The mirror that answered is RETURNED, so the caller can try it first for every later
+-- request. See installer.prefer_mirror for why that matters more than it looks.
+local function manifest_from(mirrors, log, out)
   local last_reason = nil
-  for attempt = 1, #mirrors do
+  local total = #mirrors
+
+  for attempt = 1, total do
     local mirror = installer.next_mirror(mirrors, attempt)
     local url = installer.build_url(mirror.prefix, installer.BRANCH,
       "manifest.txt")
+
+    out.refresh(string.format("looking for manifest.txt  [%d/%d] %s",
+      attempt, total, mirror.name))
     log("manifest <- " .. mirror.name)
+
     local body, reason = fetch(url)
     if body ~= nil then
       local parsed, parse_err = installer.parse_manifest(body)
@@ -772,11 +921,17 @@ local function manifest_from(mirrors, log)
         return nil, "the manifest from " .. mirror.name .. " is unusable: "
           .. tostring(parse_err)
       end
+      out.line(string.format("install: %s answered", mirror.name))
       return parsed, nil, mirror
     end
+
     last_reason = mirror.name .. ": " .. tostring(reason)
+    log("  failed: " .. last_reason)
+    out.refresh(string.format("looking for manifest.txt  [%d/%d] %s -- failed",
+      attempt, total, mirror.name))
   end
-  return nil, "no mirror served manifest.txt (" .. tostring(last_reason) .. ")"
+
+  return nil, "no mirror served manifest.txt (last: " .. tostring(last_reason) .. ")"
 end
 
 local function download_all(parsed, mirrors, out, log, opts)
@@ -846,6 +1001,11 @@ end
 
 function installer.run(argv, opts)
   opts = type(opts) == "table" and opts or {}
+
+  -- The read seam can be supplied per call, which is how a test answers a prompt.
+  if type(opts.read) == "function" then
+    seams.read = opts.read
+  end
   local out = make_writer()
   if type(opts.write) == "function" then
     out = { line = opts.write, refresh = opts.write }
@@ -866,13 +1026,14 @@ function installer.run(argv, opts)
   end
   local function usage()
     out.line("usage: install <command> [options]")
+    out.line("  (installs CCNBSLib; no arguments means install)")
     out.line("  install              fetch and install every file")
     out.line("  update               refresh the manifest only")
     out.line("  upgrade              re-fetch files whose size changed")
     out.line("  verify               report files that differ from the manifest")
     out.line("  remove [--purge]     delete installed files (--purge also state)")
     out.line("  list                 show what is installed")
-    out.line("  mirror list|add|remove|default|test")
+    out.line("  mirror list|add|remove|default|test|pick")
     out.line("options: --mirror <name>   --debug")
   end
 
@@ -917,11 +1078,26 @@ function installer.run(argv, opts)
 
   -- ---------------------------------------------------------------- install
   if command == "install" then
-    say("looking for manifest.txt")
-    local parsed, reason = manifest_from(mirrors, log)
-    if parsed == nil then
-      return fail("E_MANIFEST", reason)
+    -- ASK FIRST. The automatic order is tried only if the user declines to choose,
+    -- because a computer whose network blocks most of these hosts has no way to say
+    -- which one works -- and the alternative is twenty minutes of timeouts.
+    local chosen, why = select_mirror(mirrors, out, { allow_automatic = true })
+    if chosen ~= nil then
+      mirrors = installer.prefer_mirror(mirrors, chosen)
+      say("using " .. chosen.name)
+    elseif type(why) == "string" then
+      say(why)
     end
+
+    local parsed, reason, answered = manifest_from(mirrors, log, out)
+    if parsed == nil then
+      fail("E_MANIFEST", reason)
+      out.line("")
+      say("try: install mirror pick    (choose one interactively)")
+      return 1
+    end
+    -- The mirror that answered is tried first from here on.
+    mirrors = installer.prefer_mirror(mirrors, answered)
     say(string.format("CCNBSLib %s -- %d files", parsed.version, #parsed.files))
 
     local ok, code, detail = download_all(parsed, mirrors, out, log,
@@ -942,13 +1118,14 @@ function installer.run(argv, opts)
     return 0
   end
 
-  -- ---------------------------------------------------------------- update
-  if command == "update" then
-    local parsed, reason = manifest_from(mirrors, log)
-    if parsed == nil then
-      return fail("E_MANIFEST", reason)
-    end
-    local state_ok, state_err = make_dir(installer.STATE_DIR)
+    -- ---------------------------------------------------------------- update
+    if command == "update" then
+      local parsed, reason, answered = manifest_from(mirrors, log, out)
+      if parsed == nil then
+        return fail("E_MANIFEST", reason)
+      end
+      mirrors = installer.prefer_mirror(mirrors, answered)
+      local state_ok, state_err = make_dir(installer.STATE_DIR)
     if not state_ok then
       return fail("E_WRITE", state_err)
     end
@@ -964,12 +1141,13 @@ function installer.run(argv, opts)
     if current == nil then
       return fail("E_MISSING", "nothing is installed; run install first")
     end
-    local parsed, reason = manifest_from(mirrors, log)
-    if parsed == nil then
-      return fail("E_MANIFEST", reason)
-    end
+      local parsed, reason, answered = manifest_from(mirrors, log, out)
+      if parsed == nil then
+        return fail("E_MANIFEST", reason)
+      end
+      mirrors = installer.prefer_mirror(mirrors, answered)
 
-    local stale = {}
+      local stale = {}
     for index = 1, #parsed.files do
       local entry = parsed.files[index]
       local size = installer.file_size(installer.INSTALL_ROOT .. "/" .. entry.path)
@@ -1102,6 +1280,7 @@ function installer.run(argv, opts)
           index == 1 and "* " or "  ", list[index].name, list[index].prefix))
       end
       say("the first entry is preferred; the rest are tried in order")
+      say("use `install mirror pick` to choose one interactively")
       return 0
     end
 
@@ -1205,6 +1384,26 @@ function installer.run(argv, opts)
       if healthy == 0 then
         return fail("E_MIRROR", "no mirror answered")
       end
+      return 0
+    end
+
+    if sub == "pick" then
+      -- Change the saved order. A blank answer CANCELS, because this command exists
+      -- only to change the setting.
+      local list = load_mirrors()
+      local chosen, reason = select_mirror(list, out, { allow_automatic = false })
+
+      if chosen == nil then
+        say(reason or "nothing changed")
+        return 1
+      end
+
+      local reordered = installer.prefer_mirror(list, chosen)
+      local ok_save, save_err = save_mirrors(reordered)
+      if not ok_save then
+        return fail("E_WRITE", save_err)
+      end
+      say(chosen.name .. " answered and is now preferred")
       return 0
     end
 
