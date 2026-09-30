@@ -79,6 +79,14 @@ Never from an API field, a cache, or memory. Measured examples:
 | A size difference vs upstream | Was CRLF, not a stale artifact — I blamed upstream first |
 | `total * 0.69` as a shrink estimate | Real ratio was 0.54; the estimate was pessimistic, not safer |
 | A DELETED file's calling convention | The live API's: it took no `self` |
+| `os.epoch("ingame")` as a millisecond clock | It is the IN-GAME day clock: frozen with `doDaylightCycle` off, and 72000 ms/real-second with it on |
+| A "clock health check" that compares `os.epoch("utc")` with `now_ms()` | `now_ms()` IS `os.epoch("utc")` — it compared the clock with itself and could only report 1.0. `os.sleep` is the independent reference |
+| `term.write("\n")` "makes a newline" | Measured: the row does not change; `"\n"` is an ordinary character that moves the cursor one COLUMN |
+| The docs calling the layer byte "Layer lock" | It is a MUTE/SOLO switch: 1 = muted, 2 = solo (OpenNBS#307, which the published spec omits) |
+| A fixture suite that passes | It cannot see a bug the fixtures do not contain — the mute bug needed a real 65-layer song to appear |
+| "A line as wide as the terminal wraps, so the bar scrolls" | `term.write` never wraps — the cursor just passes the edge. The real risk is CLIPPING, and the real defect was the missing newline |
+| A hand-built fake terminal that models `"\n"` or wrapping | It is then wrong in the direction that HIDES the defect; encode only measured facts |
+| Counting live rows left on screen to prove overwriting | The last frame is legitimately replaced by the next permanent line — count WHERE ticks LAND, not what survives |
 
 **Rule: read the file, run the probe, or compare a hash. Then state the method.**
 
@@ -113,6 +121,130 @@ h.read(h, 5)   -> "0"       the table became the count  wrong
 
 `tests/nbsplay_spec.lua` now ENFORCES this: its fake response refuses an extra
 leading argument, so passing `self` fails the suite. Verified by mutation.
+
+### PERIPHERAL methods take no `self` either — same trap, and it cost the SOUND
+
+The http response handle is not special. `SpeakerPeripheral.playNote` is registered
+the same way — `@LuaFunction` on a Java method whose only Lua-visible parameters are
+the real ones (`ILuaContext` is INJECTED):
+
+```java
+@LuaFunction
+public final boolean playNote(ILuaContext context, String instrumentA,
+                              Optional<Double> volumeA, Optional<Double> pitchA)
+```
+
+So `speaker.playNote(name, volume, pitch)` — dot-style, no `self`. `player/speaker.lua`
+passed the peripheral object as the first argument, which made `instrumentA` a TABLE.
+The speaker throws `Invalid instrument` for that, `player/dispatch.lua` contains the
+raise in a pcall, and the result is the worst possible failure shape: **a normal
+progress bar and no sound at all**, for the entire song.
+
+The suite could not see it because every fake was declared
+`function object.playNote(self, name, ...)` — the fake and the implementation agreed
+with each other while BOTH disagreed with the platform. **A stub that accepts the
+wrong shape cannot catch a disagreement with the platform.** The fakes now assert the
+shape (first argument must be a string) and reject `self`, and test 5b pins it.
+
+### A clock check must use an INDEPENDENT reference
+
+The first "is the clock healthy?" check compared `os.epoch("utc")` before and after an
+`os.sleep` against `now_ms()` — but `now_ms()` IS `os.epoch("utc")`, so it compared the
+clock with itself and could only ever report a ratio of 1.0. A check that cannot fail
+is worse than no check, because it looks like one. `os.sleep` is the independent
+reference: it blocks for a known stretch of real time on the game's own timer.
+
+Measured on CraftOS-PC 2.8.3 with `doDaylightCycle` ON, over an `os.sleep(1)`:
+
+```text
+os.epoch("utc")     1001 ms     real milliseconds        -- correct
+os.epoch("ingame")  72000 ms    72x -- unusable when the cycle is ON
+os.clock() * 1000   1000 ms     real, but quantised to 50 ms
+```
+
+`os.epoch("ingame")` is wrong in BOTH directions, and silently: frozen (delay becomes
+an absolute time and the song never ends) or 72x (every event instantly overdue and
+the song dumps at once). `now_ms` therefore uses `os.epoch("utc")`.
+
+Note that the achievable TIMING is unchanged by any of this: `os.startTimer` rounds to
+0.05 s and the speaker itself batches notes per game tick (`SpeakerPeripheral.update`
+broadcasts `pendingNotes` once per tick, capped at `Config.maxNotesPerTick` = 8). 50 ms
+is the floor for note scheduling regardless of clock resolution. Sub-tick precision
+would require `playAudio` + DFPWM, which is a different architecture.
+
+---
+
+### The layer byte is a MUTE/SOLO switch, and the fixtures could not have found it
+
+The published NBS specification calls the per-layer byte "Layer lock" and documents
+only "1 = locked", which reads like an editor permission. It is not. The OpenNBS
+project's own issue tracker says so (OpenNBS/NoteBlockStudio#307):
+
+> The 'Layer lock' field, originally intended to be a boolean, may actually assume
+> values 0-2 (0= unlocked, 1=locked, 2=solo). This is currently undocumented in the
+> NBS specification...
+
+and a developer in that thread states the field is what people use to "mute
+incomplete sections of the song or single out certain layers". The decisive argument
+is that **solo is a playback concept, and solo cannot exist without a mute.**
+
+Measured on a real song the user supplied (`THE KING.nbs`, 65 layers): three layers
+carried lock=1 and **903 notes**, every one of which was being played. The fixtures
+in `tests/fixtures/` are all lock=0, so **the suite passed while the player was wrong
+— a fixture set cannot contain the bug it does not contain.** Only the real file
+showed it.
+
+Two more things this cost, both worth repeating:
+
+* The rule is owned in **one** place, `nbs/layers.lua`, and consumed by both
+  `player/plan.lua` (which notes become events) and `nbs/analyze.lua` (how many
+  speakers those events need). When they disagree, the analysis sizes the fan-out for
+  notes that will never sound.
+* The first version of the `analyze.lua` filter kept the window scan iterating the
+  FILE's note count while `items` had become a packed array of AUDIBLE notes, so it
+  indexed past the end. **492 tests passed and the real song raised**, because on a
+  song with no muted layers the two counts are equal. `total_notes` (the file) and
+  `audible_notes` (`#items`) are different quantities and the code now names both.
+
+---
+
+### `term.write` does not make a newline — and that cost a whole release
+
+The CLI wrote every permanent message as `term.write(text)` then
+`term.write("\n")`. That second call does **not** move down a row. The documentation
+says so plainly — `term.write` "does not handle more advanced features such as line
+breaks or word wrapping" — and `TermAPI.java` agrees:
+
+```java
+m_terminal.write( text );
+m_terminal.setCursorPos( m_terminal.getCursorX() + text.length(), m_terminal.getCursorY() );
+```
+
+Measured on CraftOS-PC 2.8.3, because documentation can describe another build:
+
+```text
+after write("AAAA")    x=5  y=1
+after write("\n")      x=6  y=1     the ROW did not change
+after write("BBBB")    x=10 y=1     so both landed on row 1
+after write(width+5)   x=57 y=3     no wrapping either; the cursor passes the edge
+clearLine()                         clears the WHOLE row, whatever column the cursor is on
+```
+
+So every message overwrote the one before and the screen ended up holding a single
+line — the last one. The real way down is `bios.lua`'s own `write`: `setCursorPos(1,
+y + 1)`, or `setCursorPos(1, height)` then `scroll(1)` at the bottom.
+
+**The worse mistake was how it was diagnosed.** A fake terminal was built for the
+suite that treated `"\n"` as a line break and wrapped at the right edge — both
+wrong — so a writer doing `write(text); write("\n")` PASSED while putting every line
+on one row for real. And an early "the line wraps at exactly the terminal width"
+theory was invented from that same fake and written into the docs, where it was
+simply false: `term.write` never wraps. **A hand-built model of the platform cannot
+find a disagreement with the platform.** The fake now encodes only measured facts,
+and its `write` deliberately does NOT special-case `"\n"` — removing that special
+case is what makes the defect reproducible in the suite at all. Mutation-verified:
+restoring `term.write("\n")` fails with `expected 4 separate rows, found 1: nbsplay:
+done`.
 
 ---
 
@@ -194,7 +326,7 @@ leading argument, so passing `self` fails the suite. Verified by mutation.
   **Polling with `os.sleep` does not work, and fails silently.** `os.sleep` pulls
   and discards every event until its own timer fires, so the song's timers are
   consumed with their callbacks never invoked: no notes are dispatched, the
-  program prints "done.", and there is no sound. That was a real bug in
+  program prints `nbsplay: done`, and there is no sound. That was a real bug in
   `nbsplay.lua`, caught only by driving the CLI in a test. Also check
   `clock.errors` afterwards — a raising timer callback is captured there rather
   than propagated, so ignoring it makes a broken dispatch look like a finished

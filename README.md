@@ -106,15 +106,43 @@ local ccnbs = require("ccnbslib")
 nbsplay https://example.com/song.nbs
 ```
 
-它分两个阶段显示进度：
+它分两个阶段显示进度，且**两类输出在屏幕上是分开的**：
+
+- **永久行**：每条都以 `nbsplay:` 开头，写完就换行、留在屏幕上；
+- **实时行**：进度条。它**始终占用同一行、原地刷新**，不会一帧一行地往下滚。
 
 ```text
-fetching https://example.com/song.nbs
-  [############------------]  50%  128/256 KiB
-Creeper Chase  842 notes  1:23  2 speaker(s)
-[############----------------]  50%  0:41 / 1:23  note 421/842
-done.
+nbsplay: fetching https://example.com/song.nbs
+nbsplay: decoding
+nbsplay: "Creeper Chase"  842 notes  1:23  2 speakers
+nbsplay: done
 ```
+
+上面四条是永久行；运行期间的那条进度条画在它们之间、反复覆盖自己：
+
+```text
+download [#####################] 100%  256/256 KiB
+playing [#####-----]  50%  0:41/1:23  note 421/842
+```
+
+失败一律是同样的前缀加一个**裸错误码**，进程非零退出：
+
+```text
+nbsplay: E_DECODE: E_TRUNCATED
+```
+
+> **换行不靠 `term.write("\n")`。** 实测（CraftOS-PC 2.8.3）：`term.write` 既不
+> 解释换行、也不折行——文档原话是它 "does not handle ... line breaks or word
+> wrapping"，源码里它只做
+> `setCursorPos(getCursorX() + text.length(), getCursorY())`。所以写完一行再
+> `write("\n")`，光标只是**右移一格、行号不变**；下一条消息就会盖掉上一条，屏幕
+> 最后只剩最后一行。真正的换行是 `setCursorPos(1, y + 1)`（到底部则
+> `setCursorPos(1, height)` + `scroll(1)`），`bios.lua` 自己的 `write` 就是这么做。
+>
+> 实时行的长度**严格小于终端宽度**，但那只是为了避免**被裁掉**：`term.write`
+> 超宽不折行也不报错，`TextBuffer.write` 按边界裁剪，右侧字符直接丢失。所以
+> `cli.progress_line` 宁可依次丢掉时钟、音符计数、进度条，也不让百分比被切掉；
+> 窄到极限时退化成只有一个百分比。
 
 下载阶段按 8 KiB 分块读取，所以百分比是**真实的字节进度**而不是干等；
 播放阶段从库给出的 `t_ms` 计算，因此节拍不均匀的歌也不会让进度条乱跳。
