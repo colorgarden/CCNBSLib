@@ -72,7 +72,7 @@ end
 一条命令：
 
 ```
-wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
+wget run https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
 ```
 
 `wget` 是 CraftOS 自带的，它会取回安装器并直接执行，把库装到 `/lib/`。
@@ -80,8 +80,14 @@ wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSL
 之后可以 `wget run <地址> upgrade` 更新、`wget run <地址> remove` 卸载。
 完整说明见 [`docs/CLI.md`](docs/CLI.md)。
 
-> 地址里的 `https://gh.llkk.cc/` 是代理前缀，连不上 GitHub 时用它。可换成
-> `https://ghproxy.net/` 或 `https://ghfast.top/`，能直连就整个去掉。
+> 连不上 GitHub 时，在地址前面加一个代理前缀，例如
+> `https://gh.llkk.cc/`、`https://ghproxy.net/` 或 `https://ghfast.top/`：
+>
+> ```
+> wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
+> ```
+>
+> 安装器本身也会在某个镜像不通时自动换下一个；`install mirror` 可以增删。
 
 ### 手动安装
 

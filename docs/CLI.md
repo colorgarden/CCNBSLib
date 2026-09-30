@@ -11,7 +11,7 @@
 在电脑上敲：
 
 ```
-wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
+wget run https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
 ```
 
 `wget` 是 CraftOS 自带的，它会取回安装器并直接执行，把库装到 `/lib/`，全程显示进度。
@@ -22,15 +22,22 @@ wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSL
 local ccnbs = require("ccnbslib")
 ```
 
-> 连不上 GitHub 时，地址里的 `https://gh.llkk.cc/` 是代理前缀。换成
-> `https://ghproxy.net/` 或 `https://ghfast.top/`，或者（能直连的话）整个去掉。
+### 连不上 GitHub
+
+在地址前面加一个代理前缀：
+
+```
+wget run https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua
+```
+
+可用的前缀见下面的[镜像](#镜像)一节。安装器本身在某个镜像不通时也会自动换下一个。
 
 ### 如果 wget 不可用
 
 先存成文件，再运行：
 
 ```lua
-local r = http.get("https://gh.llkk.cc/https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua")
+local r = http.get("https://raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua")
 local f = fs.open("install.lua", "w")
 f.write(r.readAll())
 f.close()
