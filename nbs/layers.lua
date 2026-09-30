@@ -120,4 +120,95 @@ function layers.parse(r, version, layer_count)
   return result
 end
 
+-- ---------------------------------------------------------------------------
+-- WHAT THE LOCK BYTE MEANS (it is a mute/solo switch, not an editor permission)
+-- ---------------------------------------------------------------------------
+-- The NBS specification calls this byte "Layer lock" and documents only "1 =
+-- locked", which reads like an editor convenience. The OpenNBS project's own issue
+-- tracker corrects that (OpenNBS/NoteBlockStudio#307):
+--
+--   "The 'Layer lock' field, originally intended to be a boolean, may actually
+--    assume values 0-2 (0= unlocked, 1=locked, 2=solo). This is currently
+--    undocumented in the NBS specification..."
+--
+-- and a developer in the same thread says the field is what people use to "mute
+-- incomplete sections of the song or single out certain layers".
+--
+-- The decisive argument is SOLO: a value of 2 is a PLAYBACK concept, and solo
+-- cannot exist without a corresponding mute. So 1 mutes, and a player that ignores
+-- it plays audio the author deliberately silenced. Measured on a real song
+-- (THE KING.nbs, 65 layers): 3 layers carried lock=1 with 903 notes, all of which
+-- were being played.
+--
+-- The rule lives HERE, next to the code that reads the byte, because TWO modules
+-- need it and they must agree: player/plan.lua decides which notes become events,
+-- and nbs/analyze.lua predicts how many speakers those events need. If the two
+-- disagreed, the analysis would size the fan-out for notes that will never play.
+
+-- The three values the byte can take.
+layers.UNLOCKED = 0
+layers.MUTED = 1
+layers.SOLO = 2
+
+-- layers.any_solo(layer_array) -> boolean
+--
+-- True when ANY layer in the song is solo.  A solo on one layer silences every
+-- non-solo layer, so this is a property of the SONG, not of a layer, and it has to
+-- be known before any single note can be judged.
+function layers.any_solo(layer_array)
+  if type(layer_array) ~= "table" then
+    return false
+  end
+  for index = 1, #layer_array do
+    local record = layer_array[index]
+    if type(record) == "table" and record.lock == layers.SOLO then
+      return true
+    end
+  end
+  return false
+end
+
+-- layers.audible(lock, any_solo) -> boolean
+--
+-- Whether a layer carrying this lock byte contributes notes.
+--
+--   lock is nil   a v0-v3 file has no lock byte at all, so nil MUST read as
+--                 unmuted; treating it as truthy would silence every old song
+--   lock = 0      unlocked: plays unless some other layer is solo
+--   lock = 1      MUTED: never plays
+--   lock = 2      SOLO: plays, and silences every layer that is not solo
+--
+-- Written as a function rather than an inline expression because the rule has four
+-- cases and an inline version is exactly where the next reader would go wrong.
+function layers.audible(lock, any_solo)
+  if any_solo then
+    -- Solo silences everything that is not itself solo -- including ordinary
+    -- unlocked layers and, for the same reason, muted ones.
+    return lock == layers.SOLO
+  end
+  return lock ~= layers.MUTED
+end
+
+-- layers.audible_at(layer_array, any_solo, layer_index) -> boolean
+--
+-- The same decision for a 0-based layer_index from a note record.  layer_array is
+-- 1-based, so layer L is layer_array[L + 1].  A reference to a layer that the
+-- decoded song does not contain has no lock byte, so it is judged as UNLOCKED --
+-- which keeps the pre-existing "a missing layer still emits" contract, and, under
+-- solo, correctly leaves it silent because it is not itself solo.
+function layers.audible_at(layer_array, any_solo, layer_index)
+  if type(layer_index) ~= "number" then
+    return true
+  end
+  local record = nil
+  if type(layer_array) == "table" then
+    record = layer_array[layer_index + 1]
+  end
+  local lock = nil
+  if type(record) == "table" then
+    lock = record.lock
+  end
+  return layers.audible(lock, any_solo)
+end
+
 return layers

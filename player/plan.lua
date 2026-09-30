@@ -75,12 +75,27 @@
 --   break the drift guarantee a later module relies on.  With a repeating
 --   tick_ms (e.g. 1000/3) tick N still reports exactly N * tick_ms.
 --
+-- MUTED AND NON-SOLO LAYERS ARE NOT PLANNED
+--   The NBS per-layer byte the specification calls "Layer lock" is really a
+--   mute/solo switch (0 unlocked, 1 muted, 2 solo -- see nbs/layers.lua for the
+--   evidence).  A muted layer, and every non-solo layer while any layer is solo,
+--   contributes NO events at all.
+--
+--   Silence means ABSENCE, not zero volume.  A muted note must not spend a speaker
+--   call: CC:Tweaked caps a speaker at 8 notes per game tick
+--   (SpeakerPeripheral.playNote returns false past `Config.maxNotesPerTick`), so an
+--   event emitted at volume 0 would crowd out notes that should sound.
+--
+--   This is the ONE thing this module decides about a note's audibility, and it
+--   decides it with the same rule nbs/analyze.lua uses, so the plan and the
+--   capacity analysis can never disagree about which notes will play.
+--
 -- CUSTOM NOTES ARE STILL EMITTED
---   This module does not decide whether a note is PLAYED; it PLANS.  A custom
---   instrument becomes an event with kind == "custom", name == nil and a
---   custom_index.  The dispatch layer refuses it later.  Emitting it keeps the
---   plan a faithful, complete projection of the song, which is exactly what
---   makes a plan-vs-recording comparison meaningful.
+--   Apart from the audibility rule above, this module does not decide whether a
+--   note is PLAYED; it PLANS.  A custom instrument becomes an event with
+--   kind == "custom", name == nil and a custom_index.  The dispatch layer refuses
+--   it later.  Emitting it keeps the plan a faithful projection of the AUDIBLE
+--   song, which is exactly what makes a plan-vs-recording comparison meaningful.
 --
 -- MISSING LAYER
 --   The decoded layer array is 1-based, so layer_index L reads layers[L + 1].
@@ -100,6 +115,9 @@
 
 local mapping = require("player.mapping")
 local instrument_table = require("nbs.instrument_table")
+-- The mute/solo rule.  It lives in nbs/layers.lua, next to the code that reads the
+-- byte, because nbs/analyze.lua needs the SAME rule -- see the note there.
+local layer_format = require("nbs.layers")
 
 local plan = {}
 
@@ -142,14 +160,26 @@ function plan.plan(song, analysis)
   local header = song.header or {}
   local vanilla_instrument_count = header.vanilla_instrument_count
   local tick_ms = analysis.tick_ms
-  local total = #notes
 
-  -- Orderable copies of the input notes.  The input array itself is only read;
-  -- `position` is the 1-based input index, used purely to break ties WITHIN an
-  -- already-equal (tick, layer) group.
+  -- Whether the song is in SOLO mode.  Computed ONCE, over the whole layer array,
+  -- because a solo on ANY layer silences every non-solo one -- so this cannot be
+  -- decided note by note.
+  local any_solo = layer_format.any_solo(layers)
+
+  -- Orderable copies of the notes that are actually AUDIBLE.  The input array
+  -- itself is only read; `position` is the 1-based input index, used purely to
+  -- break ties WITHIN an already-equal (tick, layer) group.
+  --
+  -- Filtering here rather than inside the emit loop keeps `total` honest and means
+  -- the grouping below can only ever see notes that will be emitted.
   local grouped = {}
-  for index = 1, total do
-    grouped[index] = { record = notes[index], position = index }
+  local total = 0
+  for index = 1, #notes do
+    local record = notes[index]
+    if layer_format.audible_at(layers, any_solo, record.layer) then
+      total = total + 1
+      grouped[total] = { record = record, position = index }
+    end
   end
   table.sort(grouped, less_grouped)
 

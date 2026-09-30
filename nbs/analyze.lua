@@ -111,6 +111,10 @@
 
 local instrument_table = require("nbs.instrument_table")
 local mapping = require("player.mapping")
+-- The mute/solo rule, shared with player/plan.lua so analysis and the plan can
+-- never disagree about which notes will play.  nbs/layers.lua requires nothing,
+-- so this adds no cycle.
+local layers_module = require("nbs.layers")
 
 local analyze = {}
 
@@ -127,14 +131,27 @@ local PEAK_WINDOW_MS = 50
 function analyze.analyze(song)
   local header = song.header or {}
   local notes = song.notes or {}
+  local layers = song.layers or {}
   local total_notes = #notes
 
   local ticks_per_second = header.tempo_ticks_per_second
   local tick_ms = 1000 / ticks_per_second
 
-  -- Key range + extended-range scan (over ALL notes, independent of the 50 ms
-  -- window) plus ONE classification pass: each note's bucket is decided here by
-  -- the single owner of the rule (instrument_table.bucket_of), and the SAME
+  -- MUTED AND NON-SOLO LAYERS ARE EXCLUDED, using the SAME rule player/plan.lua
+  -- uses to decide which notes become events (nbs/layers.lua owns it).  If the two
+  -- disagreed, every capacity figure below would describe notes that will never
+  -- play: the fan-out sizes itself from `peak_concurrent` and
+  -- nbs.speakers.required_count(analysis), so an inflated peak means a spurious
+  -- "not enough speakers" warning and dropped events.
+  --
+  -- `total_notes` deliberately still counts the FILE's notes -- it is a fact about
+  -- the song, not a playback prediction -- so on a song with muted layers it is
+  -- legitimately larger than the number of events the planner emits.
+  local any_solo = layers_module.any_solo(layers)
+
+  -- Key range + extended-range scan (over every AUDIBLE note, independent of the
+  -- 50 ms window) plus ONE classification pass: each note's bucket is decided here
+  -- by the single owner of the rule (instrument_table.bucket_of), and the SAME
   -- decision is kept for the window pass below -- so the window selection and
   -- the reported split can never disagree.
   local min_key = 0
@@ -150,38 +167,51 @@ function analyze.analyze(song)
   local items = {}
   for index = 1, total_notes do
     local note = notes[index]
-    local key = note.key
-    if index == 1 then
-      min_key = key
-      max_key = key
-    else
-      if key < min_key then
+
+    if layers_module.audible_at(layers, any_solo, note.layer) then
+      local key = note.key
+      if #items == 0 then
+        -- The FIRST audible note seeds the range, not the file's first note: a
+        -- muted note must not define the song's key span.
         min_key = key
-      end
-      if key > max_key then
         max_key = key
+      else
+        if key < min_key then
+          min_key = key
+        end
+        if key > max_key then
+          max_key = key
+        end
       end
+      if key < mapping.NATIVE_MIN_KEY or key > mapping.NATIVE_MAX_KEY then
+        has_extended_range = true
+      end
+      local bucket = instrument_table.bucket_of(note.instrument,
+        header.vanilla_instrument_count)
+      local consumes = bucket == "vanilla" or bucket == "play_sound"
+      if consumes then
+        playable_notes = playable_notes + 1
+        capacity_notes = capacity_notes + 1
+      end
+      items[#items + 1] = {
+        t = note.tick * tick_ms,
+        bucket = bucket,
+        consumes = consumes,
+      }
     end
-    if key < mapping.NATIVE_MIN_KEY or key > mapping.NATIVE_MAX_KEY then
-      has_extended_range = true
-    end
-    local bucket = instrument_table.bucket_of(note.instrument,
-      header.vanilla_instrument_count)
-    local consumes = bucket == "vanilla" or bucket == "play_sound"
-    if consumes then
-      playable_notes = playable_notes + 1
-      capacity_notes = capacity_notes + 1
-    end
-    items[index] = {
-      t = note.tick * tick_ms,
-      bucket = bucket,
-      consumes = consumes,
-    }
   end
 
   table.sort(items, function(a, b)
     return a.t < b.t
   end)
+
+  -- The window scans below run over the AUDIBLE notes, which is what `items`
+  -- holds.  It is PACKED, so it has `audible_notes` entries and indexing it with
+  -- the file's note count runs off the end.  `total_notes` stays the file's count
+  -- for the reported field, and the two are equal on any song without muted
+  -- layers -- which is every fixture, so the suite could not have caught the
+  -- difference. A real 65-layer song with muted layers is what exposed it.
+  local audible_notes = #items
 
   -- Two-pointer sliding window over the sorted times.  `j` is monotonic: as the
   -- left edge moves right the window can only extend, never retract, so a single
@@ -200,7 +230,7 @@ function analyze.analyze(song)
     -- count is O(1) while the two pointers slide.
     local prefix = {}
     prefix[0] = 0
-    for index = 1, total_notes do
+    for index = 1, audible_notes do
       local step = 0
       if items[index].consumes then
         step = 1
@@ -209,11 +239,11 @@ function analyze.analyze(song)
     end
 
     local j = 1
-    for i = 1, total_notes do
+    for i = 1, audible_notes do
       if j < i then
         j = i
       end
-      while j <= total_notes and items[j].t - items[i].t < PEAK_WINDOW_MS do
+      while j <= audible_notes and items[j].t - items[i].t < PEAK_WINDOW_MS do
         j = j + 1
       end
       local capacity_count = prefix[j - 1] - prefix[i - 1]
@@ -229,11 +259,11 @@ function analyze.analyze(song)
     -- so peak_concurrent still reports the song's density; both buckets and the
     -- requirement stay 0.
     local j = 1
-    for i = 1, total_notes do
+    for i = 1, audible_notes do
       if j < i then
         j = i
       end
-      while j <= total_notes and items[j].t - items[i].t < PEAK_WINDOW_MS do
+      while j <= audible_notes and items[j].t - items[i].t < PEAK_WINDOW_MS do
         j = j + 1
       end
       local count = j - i
@@ -289,7 +319,11 @@ function analyze.analyze(song)
     -- (custom instrument ids).  A plain boolean, derived from the whole song --
     -- NOT from the reported window, whose buckets can be 0/0 for a song that
     -- still has playable notes elsewhere.
-    all_notes_custom = total_notes > 0 and playable_notes == 0,
+    --
+    -- Based on the AUDIBLE note count, not the file's: a song whose every layer is
+    -- muted also plays nothing, and reporting that as "all notes are custom
+    -- instruments" would name the wrong cause.
+    all_notes_custom = audible_notes > 0 and playable_notes == 0,
     loop = {
       loop = header.loop,
       max_loop_count = header.max_loop_count,
