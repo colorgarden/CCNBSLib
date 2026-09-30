@@ -62,6 +62,7 @@ end
 -- compile-level assurance, and that is the gap this closes.
 local default_ccnbs = try(pcall(require, "ccnbslib"))
 local default_runtime = try(pcall(require, "player.runtime"))
+local default_clock = try(pcall(require, "player.clock"))
 
 -- ---------------------------------------------------------------------------
 -- Pure parts -- these are what the spec drives, because they are the parts where
@@ -175,18 +176,6 @@ local function terminal()
   return seams.term or raw_global("term")
 end
 
-local function clock_sleep(seconds)
-  local sleeper = seams.sleep
-  if type(sleeper) == "function" then
-    sleeper(seconds)
-    return
-  end
-  local oslib = raw_global("os")
-  if type(oslib) == "table" and type(oslib.sleep) == "function" then
-    oslib.sleep(seconds)
-  end
-end
-
 -- library() -> the ccnbslib table, injected or the real one.  EVERY use in
 -- run() goes through here, so a test can supply a fake library: no speakers,
 -- no clock, no waiting, and the whole path becomes assertable.
@@ -203,6 +192,23 @@ local function runtime_module()
     return seams.runtime
   end
   return default_runtime
+end
+
+-- current_clock() -> the clock playback is timed by.
+--
+-- THE CLOCK MUST BE PUMPED, not merely handed over. `after()` arms a timer;
+-- the callback runs only when `run_due()` drains `timer` events and dispatches
+-- the matching handle. Polling with os.sleep does NOT work: os.sleep pulls and
+-- discards every event until its own timer fires, so the song's timers are
+-- consumed with their callbacks never invoked -- silence, reported as success.
+local function current_clock()
+  if type(seams.clock) == "table" then
+    return seams.clock
+  end
+  if default_clock ~= nil and type(default_clock.new_os) == "function" then
+    return default_clock.new_os()
+  end
+  return nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -226,6 +232,8 @@ end
 --   E_EMPTY          the server answered with nothing
 --   E_DECODE         the library rejected the bytes (its code follows)
 --   E_NO_SPEAKER     no speaker peripheral is attached
+--   E_NO_CLOCK       player.clock is missing, or cannot be driven
+--   E_DISPATCH       the clock stopped early, or a timer callback raised
 --   E_PLAY           the library returned no usable session
 
 local function make_writer()
@@ -402,9 +410,22 @@ function cli.run(argv, opts)
     return 1
   end
 
+  local clock = current_clock()
+  if clock == nil then
+    line("E_NO_CLOCK: player.clock is missing, so playback cannot be timed")
+    return 1
+  end
+  if type(clock.run_due) ~= "function" then
+    -- Refused rather than degraded: polling cannot drive this clock, so
+    -- accepting it here would mean accepting a silent song.
+    line("E_NO_CLOCK: this clock cannot be driven (no run_due)")
+    return 1
+  end
+
   local session = lib.play(events, {
     analysis = analysis,
     speakers = speakers,
+    clock = clock,
     on_progress = function(info)
       local elapsed = tonumber(info.t_ms) or 0
       local frac = duration > 0 and (elapsed / duration) or 0
@@ -428,10 +449,31 @@ function cli.run(argv, opts)
     return 1
   end
 
-  -- Poll until the song ends.  Playing is scheduled on a clock inside the
-  -- library, so this loop only waits and redraws.
-  while type(session.is_playing) == "function" and session.is_playing() do
-    clock_sleep(0.1)
+  -- DRIVE THE SONG. run_due() blocks on os.pullEvent("timer") and dispatches
+  -- each armed handle until none remains -- which is the whole song. The
+  -- progress callback fires from inside that dispatch, so the bar still moves.
+  clock.run_due()
+
+  -- A timer callback that raised was CAPTURED, not propagated, so without this
+  -- a broken dispatch would look exactly like a song that finished.
+  if type(clock.errors) == "table" and #clock.errors > 0 then
+    local first = clock.errors[1]
+    local message = type(first) == "table" and first.message or tostring(first)
+    line("E_DISPATCH: " .. tostring(message))
+    if rt ~= nil and type(rt.cleanup) == "function" then
+      pcall(rt.cleanup, speakers, session)
+    end
+    return 1
+  end
+
+  -- If it still reports itself playing once the clock has drained, something
+  -- stopped early. Saying "done." there would be a lie.
+  if type(session.is_playing) == "function" and session.is_playing() then
+    line("E_DISPATCH: playback did not finish; the clock stopped early")
+    if rt ~= nil and type(rt.cleanup) == "function" then
+      pcall(rt.cleanup, speakers, session)
+    end
+    return 1
   end
 
   -- Speakers are stopped on EVERY path, including this one, because a speaker

@@ -179,6 +179,26 @@ leading argument, so passing `self` fails the suite. Verified by mutation.
   place allowed to do it, and only for display.
 * **The clock seam is how time is controlled.** `opts.clock` lets a test run a
   whole song instantly. Anything time-dependent must go through it.
+* **A SESSION DOES NOT DRIVE ITSELF — THE CALLER MUST PUMP THE CLOCK.**
+  `ccnbslib.play` arms timers and returns; it does not run them.
+  `player.clock.new_os().after()` calls `os.startTimer` and records the handle, and
+  the callback runs only when `run_due()` drains `timer` events and dispatches that
+  handle. So a consumer must:
+
+  ```lua
+  local clock = require("player.clock").new_os()
+  local session = ccnbslib.play(song, { clock = clock })
+  clock.run_due()   -- blocks for the whole song; without it, SILENCE
+  ```
+
+  **Polling with `os.sleep` does not work, and fails silently.** `os.sleep` pulls
+  and discards every event until its own timer fires, so the song's timers are
+  consumed with their callbacks never invoked: no notes are dispatched, the
+  program prints "done.", and there is no sound. That was a real bug in
+  `nbsplay.lua`, caught only by driving the CLI in a test. Also check
+  `clock.errors` afterwards — a raising timer callback is captured there rather
+  than propagated, so ignoring it makes a broken dispatch look like a finished
+  song.
 
 ---
 
