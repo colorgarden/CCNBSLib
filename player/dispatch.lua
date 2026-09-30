@@ -13,6 +13,9 @@
 --
 --   dispatch.WARN_CUSTOM_INSTRUMENT = "custom-instrument"
 --   dispatch.WARN_PLAY_SOUND_PITCH  = "play-sound-pitch"
+--   dispatch.WARN_NOTES_DROPPED     = "notes-dropped"   (declared here, reported
+--                                                       by ccnbslib.play so it
+--                                                       can carry a count)
 --
 --   result = {
 --     called        boolean,        -- true when a speaker method was invoked
@@ -107,6 +110,21 @@ local dispatch = {}
 -- player/warnings.lua (a later task); dispatch only names the codes.
 dispatch.WARN_CUSTOM_INSTRUMENT = "custom-instrument"
 dispatch.WARN_PLAY_SOUND_PITCH = "play-sound-pitch"
+
+-- Emitted by the LIBRARY (ccnbslib.play), not here, so it can carry a COUNT.
+--
+-- A CC:Tweaked speaker refuses a note when more than `maxNotesPerTick` notes have
+-- already been queued in the current game tick -- 8 by default, straight from
+-- Config.maxNotesPerTick in SpeakerPeripheral.playNote. It signals that by
+-- returning FALSE, not by raising, so a dense passage silently loses notes: the
+-- speaker is simply not obliged to play everything it is handed. That is why the
+-- count only exists once the song has run, and why this module -- which sees one
+-- event at a time -- cannot report it on its own.
+--
+-- This dispatcher's job here is only to make the refusal OBSERVABLE: a refusal
+-- arrives as `called = true, refused = true`, which ccnbslib.play tallies and
+-- reports once per session as { count = <dropped> }.
+dispatch.WARN_NOTES_DROPPED = "notes-dropped"
 
 -- The playSound ratio reference: key 45 (F#4) maps to ratio 1.0.  Mirrors
 -- player/mapping.lua rule (4); used ONLY to detect whether the returned ratio

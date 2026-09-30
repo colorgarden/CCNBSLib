@@ -289,12 +289,19 @@ function ccnbs.play(song_or_plan, opts)
   local dispatcher = dispatch_module.new({})
   local fired = 0
   local custom_count = 0
+  local dropped_count = 0
 
   -- Deferred warnings that only know their final count once playback has run:
-  -- "custom-instrument" reports how many custom events were actually refused.
+  -- "custom-instrument" reports how many custom events were actually refused, and
+  -- "notes-dropped" how many notes a speaker refused.  Both are deferred for the
+  -- same reason: the count is the useful part, and it does not exist until the
+  -- song ends.
   local function finish_warnings()
     if custom_count > 0 then
       emit("custom-instrument", { count = custom_count })
+    end
+    if dropped_count > 0 then
+      emit(dispatch_module.WARN_NOTES_DROPPED, { count = dropped_count })
     end
   end
 
@@ -324,6 +331,14 @@ function ccnbs.play(song_or_plan, opts)
         if result ~= nil
           and result.warning_code == dispatch_module.WARN_PLAY_SOUND_PITCH then
           emit(dispatch_module.WARN_PLAY_SOUND_PITCH, {})
+        end
+        -- A REFUSAL is the speaker saying "no" -- it hit its per-tick note limit
+        -- and returned false instead of raising.  That note produced no sound, so
+        -- it is counted and reported once, with a total, when the song ends.
+        -- Without this the loss is completely silent: everything looks correct
+        -- while dense passages simply never sound.
+        if result ~= nil and result.called and result.refused then
+          dropped_count = dropped_count + 1
         end
         if event.kind == "custom" then
           custom_count = custom_count + 1
