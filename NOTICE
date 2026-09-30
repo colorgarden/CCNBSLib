@@ -1,148 +1,71 @@
 NOTICE
 ======
 
-CCNBSPlayer
+CCNBSLib
 Copyright (c) 2026 colorgarden
 This project's own code is licensed under the GNU General Public License,
 version 2 (GPL-2.0, not "or later"). See LICENSE.
 
-The third-party components listed under "Vendored components" and
-"Third-party components" below are separate works. Where a component carries its
-own license, that license governs it and is stated here; this project's GPL-2.0
-does not replace it. The `.nbs` test fixtures are NOT covered by this project's
-GPL-2.0 at all and remain under their own licenses as stated below.
-
-This project is an independent implementation. Its architecture and its approach
-to rendering Chinese on a CC:Tweaked terminal were modelled on the MPlayer
-project (credited below); no MPlayer source was copied into this repository. This
-project is not affiliated with, endorsed by, or sponsored by Open Note Block
-Studio, Mojang, Microsoft, the CC:Tweaked maintainers, the Basalt maintainers, or
-the authors of MPlayer.
+This project is an independent implementation. It is not affiliated with,
+endorsed by, or sponsored by Open Note Block Studio, Mojang, Microsoft, or the
+CC:Tweaked maintainers.
 
 
-Vendored components (committed to this repository)
---------------------------------------------------
-Unlike the test fixtures, the following third-party source IS committed to this
-repository and IS distributed with it, under `vendor/`. It is vendored rather
-than fetched at runtime because Basalt's modules resolve each other through
-`require`, which does not work from a directory that is not on `package.path`.
-See `vendor/README.md` for the provenance and how to verify it.
+The library contains NO third-party code
+-----------------------------------------
+Everything distributed in this repository was written from scratch for this
+project and is covered by its GPL-2.0 licence:
 
-1. Basalt 2 (fork build) - https://github.com/HKXingluo/Basalt2
-   A fork of Basalt 2 - https://github.com/Pyroxenium/Basalt2
-   Copyright (c) 2025 Pyroxenium (upstream); fork maintained by HKXingluo
-   Licensed under the MIT License. Full text: `vendor/LICENSE-Basalt2`.
-   The fork keeps the upstream MIT licence.
-   WHY THE FORK: official Basalt 2 cannot render Chinese in its text elements --
-   a label or button only accepts plain text, drawn with CC's built-in font,
-   which has no CJK glyphs. The fork adds `setImage()` to text elements so they
-   can display a bimg bitmap. The reference project (MPlayer) is built on this
-   fork, and this project follows it. The fork is a superset, so code written
-   against official Basalt continues to work.
-   Vendored as: `vendor/basalt.lua` — verbatim from the fork's published
-   `release/basalt-full.lua` at commit
-   5adef1851b1aba4cd21f566f826a7f0194a24b42 (324,622 bytes, SHA256
-   5a273409fce6baaa89ae17d72332f4ad6e3c4232c3e3e426276cdbfa33a6d538).
-   Used for: the entire user interface framework, including the installer's GUI.
+    ccnbslib.lua     the public entry point
+    nbs/*.lua        parsing: reader, header, layers, notes, instruments,
+                     decode, analyze, and the CP1252 display converter
+    player/*.lua     scheduling: plan, fanout, tempo, dispatch, speaker,
+                     clock, runtime
+    nbsplay.lua      the minimal command-line player
+    tests/**         the local test suite (not published)
 
-2. ComputerCraft-Utf8 (`utf8display`) - https://git.liulikeji.cn/xingluo/ComputerCraft-Utf8
-   Copyright (c) the ComputerCraft-Utf8 author (xingluo / HKXingluo)
-   LICENSING POSITION - PLEASE READ: this component declares NO LICENSE of its
-   own. Its repository contains no LICENSE, COPYING or NOTICE file, and its
-   source carries no license header, no copyright line and no SPDX identifier.
-   It is redistributed here on the basis of PROVENANCE, not of a license file:
-   the same author also publishes MPlayer (GPL-2.0), and MPlayer distributes this
-   file as part of its own GPL-2.0 work. This project therefore receives it from
-   its own copyright holder under GPL-2.0, which is the same license this project
-   already uses. It carries no separate license of its own and none is claimed
-   here. If you are the author and want this handled differently, please make
-   contact so it can be corrected.
-   Vendored as: `vendor/utf8display.lua`.
-   Used for: drawing CJK glyphs as bitmaps, because a stock CC:Tweaked terminal
-   has no CJK font.
-3. MPlayer icon set - https://git.liulikeji.cn/xingluo/MPlayer
-   Copyright (c) the MPlayer author (xingluo / HKXingluo)
-   Licensed under the GNU General Public License version 2 (GPL-2.0); the
-   repository's LICENSE file is the GPL-2.0 text and its README states the
-   licence explicitly. This project is also GPL-2.0, so the icons may be
-   redistributed here.
-   WHAT IS COPIED: the 35 icon files under `src/icons/`, unmodified. Each is pure
-   DATA -- a Lua chunk returning a bimg bitmap that Basalt's `setImage` accepts:
-       return {
-       {"\135\151\144\139","BQBB","QBQQ"},
-       ...
-       }
-   They are assets, not logic, so copying them copies artwork rather than
-   re-implementing behaviour. MPlayer draws its buttons with icons instead of
-   text, and this project's interface follows that design.
-   Vendored as: `vendor/mplayer-icons/` (35 files, 4,607 bytes total).
-   Used for: every icon button and icon label in the interface.
+There is no `vendor/` directory and nothing here is vendored. Earlier revisions
+of this project DID redistribute third-party interface code — a Basalt 2 fork, a
+CJK pixel-font renderer, an icon set, and a font fetched at run time. All of it
+was deleted when this project became a library, and this file was rewritten
+because every claim it used to make had become false. That history is in git.
 
-
-
-Third-party components (NOT committed; obtained at runtime)
------------------------------------------------------------
-4. Fusion Pixel Font - https://github.com/TakWolf/fusion-pixel-font
-   Copyright (c) TakWolf
-   Licensed under the MIT License.
-   NOT distributed with this repository. The font is downloaded onto the user's
-   own computer at runtime by `ui/cjk.lua`, because the 8px font is 1,681,325
-   bytes and a default CC:Tweaked computer's disk limit is 1,000,000 bytes, so
-   the font cannot be stored alongside the program on a default server. This is
-   the same approach MPlayer takes.
-
-5. MPlayer - https://git.liulikeji.cn/xingluo/MPlayer
-   Copyright (c) the MPlayer author (xingluo / HKXingluo)
-   Licensed under the GNU General Public License version 2 (GPL-2.0); the
-   repository's LICENSE file is the GPL-2.0 text and its README states the
-   license explicitly.
-   WHAT IS COPIED: only the icon set, as item 6 above. MPlayer's PROGRAM CODE is
-   NOT distributed with this repository and no logic was copied from it: its
-   screen is built around NetEase music, QR login, IME input and lyrics, none of
-   which this project has. What this project took from MPlayer is its interface
-   DESIGN -- the dark palette, the top bar, the scrolling home sections, the
-   playback bar -- reimplemented over Note Block World, plus the icon assets.
-   Credited also because MPlayer is the GPL-2.0 work through which `utf8display`
-   (item 5 above) and the Basalt fork (item 4 above) reach this project.
-
-
-The project's own code
-----------------------
-Everything this project wrote itself is under GPL-2.0: `nbs/`, `player/`, `ui/`
-(except for the vendored files it loads), `net/`, `installer.lua`, `ccnbs.lua`,
-`ccnbsplayer.lua` and `qa/`. The only third-party source in the distributed
-player is the `vendor/` directory described above.
+If a future need arises for a third-party library, that is a decision for the
+project owner, not a vendoring detail — and this file must be updated to say
+exactly what was taken, from where, and under which licence.
 
 
 Test fixtures (NOT distributed with this repository)
 ----------------------------------------------------
-The local test suite uses a small number of .nbs fixtures from permissively
-licensed open-source projects in order to verify the decoder against known-good
-input. Those fixtures are NOT distributed with this repository, but the
-attributions are retained here because the project depends on them during
-development, and because anyone who obtains the test suite separately should see
-where its input came from.
+The local test suite uses a small number of `.nbs` fixtures from permissively
+licensed open-source projects, in order to verify the decoder against known-good
+input. The fixtures are NOT distributed with this repository — `tests/` is
+excluded — but the attributions are retained here because the project depends on
+them during development, and because anyone who obtains the test suite separately
+should see where its input came from.
 
-6. pynbs - https://github.com/OpenNBS/pynbs
+1. pynbs - https://github.com/OpenNBS/pynbs
    Copyright (c) Open Note Block Studio contributors
    Licensed under the MIT License.
-   Used for: .nbs test fixtures and their parsed-output golden snapshots, as
+   Used for: `.nbs` test fixtures and their parsed-output golden snapshots, as
    well as the minimal legacy/current song goldens.
 
-7. nbs.js - https://github.com/OpenNBS/nbs.js
+2. nbs.js - https://github.com/OpenNBS/nbs.js
    Copyright (c) Open Note Block Studio contributors
    Licensed under the MIT License.
    Used for: the version 6 test fixture and its documented expected values.
 
-8. Open Note Block Studio - https://github.com/OpenNBS/NoteBlockStudio
-    Copyright (c) Open Note Block Studio contributors
-    Licensed under the MIT License.
-    Used for: the upstream demo songs that the above fixtures are derived from.
+3. Open Note Block Studio - https://github.com/OpenNBS/NoteBlockStudio
+   Copyright (c) Open Note Block Studio contributors
+   Licensed under the MIT License.
+   Used for: the upstream demo songs that the above fixtures are derived from.
+
+These fixtures remain under their own MIT licences and are NOT covered by this
+project's GPL-2.0.
 
 
 Trademarks
 ----------
 "Minecraft" is a trademark of Mojang Synergies AB. "ComputerCraft" and
-"CC:Tweaked" refer to their respective projects and maintainers. All
-trademarks remain the property of their owners. Reference to them is
-descriptive only.
+"CC:Tweaked" refer to their respective projects and maintainers. All trademarks
+remain the property of their owners. Reference to them is descriptive only.
