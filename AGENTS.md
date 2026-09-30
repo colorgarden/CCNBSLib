@@ -1,188 +1,163 @@
-# AGENTS.md — CCNBSPlayer agent instructions
+# AGENTS.md — CCNBSLib agent instructions
 
-**This file is binding for every agent session in this repository.** It exists
-because the same failure recurred across sessions: an agent was asked to follow
-a reference implementation and instead invented its own, then had to be
-corrected. Read this before planning anything.
+**This file is binding for every agent session in this repository.** Read it before
+planning anything.
+
+The project is a **library**. It parses `.nbs` scores and schedules them to
+`speaker` peripherals. It has no interface, no installer, no network client, and
+no third-party code. It used to be an application called CCNBSPlayer with all of
+those; they were deleted on request, and that history is deliberate context — much
+of what follows is what that deletion cost.
 
 ---
 
-## 1. THE PRIME DIRECTIVE: READ THE REFERENCE BEFORE YOU DESIGN
-
-When the user says **"照抄 MPlayer"** (copy MPlayer), or anything equivalent, they
-mean **read MPlayer's source and reproduce it**. They do not mean "build
-something inspired by it".
-
-The reference implementation is readable source, not a compressed blob:
+## 1. THE SHAPE OF THE THING
 
 ```
-https://git.liulikeji.cn/xingluo/MPlayer
-  branch: master
-  src/startup.lua          9,545 lines, ~34 bytes/line — READABLE. Read it.
-  src/Api/MusicApi.lua     the client pattern (async + token + retry)
-  src/Api/ImeApi.lua       the pinyin input client
-  src/Lib/Player.lua       the player library
-  src/Settings.lua         settings persistence + the settings projects
-  src/icons/*.lua          35 bimg icons (vendored here already)
-  src/install.lua          the GUI installer (the model for installer.lua)
-  release/install_list.lua the install manifest + the third-party URLs
+bytes ──decode──> song ──analyze──> analysis ──plan──> events ──play──> speakers
+                     │                                        │
+                     └── v0-v5 strings are CP1252 bytes ──────┘
+                         (cp1252.to_display is a SEPARATE,
+                          explicit step for showing them)
 ```
 
-**Fetch it before planning.** Examples of the cost of not doing so, all real:
+* `ccnbslib.lua` (project root) is the ONLY public entry point.
+  `require("ccnbslib")` gives the whole pipeline.
+* `nbs/` is parsing: reader → header → layers/notes → instruments → decode → analyze.
+* `player/` is scheduling: plan → fanout → tempo → dispatch → speaker, plus `clock`
+  (the injectable timer seam) and `runtime` (safe shutdown).
+* `nbsplay.lua` is a minimal CLI: one URL, one song, one progress bar. It is a
+  demonstration, not a product surface.
+
+**A LIBRARY DOES NOT OWN THE EVENT LOOP.** `ccnbslib.play` returns a session
+immediately and never blocks. The caller decides when to wait. Do not add a
+`run()` that takes the loop.
+
+---
+
+## 2. READ THE REFERENCE BEFORE YOU DESIGN
+
+When the user says **"照抄 MPlayer"** (copy MPlayer), they mean *read its source
+and reproduce it*. The reference is readable Lua, not a compressed blob:
+
+```
+https://git.liulikeji.cn/xingluo/MPlayer    branch: master
+  src/startup.lua      9,545 lines, ~34 bytes/line — READABLE. Read it.
+  src/Settings.lua     settings persistence
+  src/Api/ImeApi.lua   the pinyin client
+  src/Lib/Player.lua   playback
+  src/install.lua      the GUI installer
+  release/install_list.lua   the install manifest + third-party URLs
+```
+
+Costs of not doing so, all real, all in this repository's history:
 
 * Claimed the installer "followed MPlayer" without ever reading it. It did not:
   MPlayer's is a Basalt GUI with a progress bar and a button state machine.
-* Did not notice MPlayer opens with a `package`/`shell` shim. Without it the
-  vendored Basalt cannot load at all, so the GUI never appeared and the failure
-  was swallowed.
+* Missed that MPlayer opens with a `package`/`shell` shim. Without it the vendored
+  Basalt could not load at all, so the GUI never appeared and the failure was
+  swallowed by a `pcall` that returned a bare nil.
 * Vendored the OFFICIAL Basalt instead of the fork MPlayer uses. The official
-  build cannot render Chinese in text elements, so the whole Chinese UI was built
-  on a framework that cannot do the job.
+  build cannot render Chinese in text elements, so the entire Chinese interface
+  was built on a framework that could not do the job.
 
-**Rule: before writing a line that reproduces MPlayer behaviour, `curl` the
-relevant MPlayer file and read it.** It takes one call and prevents all of the
-above.
+**Rule: before writing a line that reproduces reference behaviour, `curl` the
+relevant file and read it.** One call.
 
 ---
 
-## 2. Confirm facts from the SOURCE or a PROBE — never from an API field or memory
+## 3. CONFIRM FACTS FROM THE SOURCE OR A PROBE
 
-Measured examples of trusting the wrong thing:
+Never from an API field, a cache, or memory. Measured examples:
 
 | Trusted | Reality |
 |---|---|
 | Gitea `license` API field said `None` | The repo's LICENSE file was GPL-2.0, 17,337 bytes |
 | `tostring(a_table):find("write")` | Can never match; reported a false failure |
 | A grep count of `setImage` = 0 | The name is generated at runtime, not absent |
-| `git check-ignore` on `agent/` | Ignored and would have made `installer.lua` unshippable |
-| raw CDN after a push | Served the OLD file for ~5 min (`max-age=300`); git held the new one |
+| raw CDN right after a push | Served the OLD file for ~5 min (`max-age=300`) |
+| A size difference vs upstream | Was CRLF, not a stale artifact — I blamed upstream first |
+| `total * 0.69` as a shrink estimate | Real ratio was 0.54; the estimate was pessimistic, not safer |
 
 **Rule: read the file, run the probe, or compare a hash. Then state the method.**
 
 ---
 
-## 3. PROJECT CONSTRAINTS (hard, checked by the gate)
+## 4. PROJECT CONSTRAINTS (hard)
 
-* **THE DISK LIMIT IS A DESIGN CONSTRAINT, NOT A DETAIL.** A default CC:Tweaked
-  computer holds **1,000,000 bytes**. This project's sources measured
-  **1,123,336 B** installed — 123 KB OVER, so the install did not merely waste
-  space, it **could not fit**. The reference implementation had already solved
-  this and the lesson was recorded in its `release/` artifacts, not its docs:
-  1. it **minifies** what it ships (9,545 lines of source become a 232 KB bundle),
-     and
-  2. it **does not install its own installer**.
-  This project now does both. `installer.shrink_for_install` strips comments from
-  OUR OWN Lua as it is written (measured 1,128,115 → 777,036 B) and **never
-  touches `vendor/**`**, whose comments carry upstream attribution. The install
-  now costs ~720 KB, leaving ~280 KB for the user's songs.
-  **Before adding a module, measure the install. Any change that pushes it past
-  1,000,000 B ships something that cannot be installed.**
 * **Language subset** — CC:Tweaked Cobalt, Lua 5.2 base. FORBIDDEN in our code:
   `//`, bitwise operators, `math.maxinteger`, `collectgarbage`, `string.dump`,
   `os.exit`, `goto`. `lua tests/lint.lua` must exit 0.
-  NOTE: lint does **not** check `utf8.*` — that is a convention, enforced by
-  review, and it exists because the desktop interpreter (stock Lua 5.2.4) lacks
-  `utf8`.
-* **Licence: GPL-2.0.** Third-party code is vendored under `vendor/` with
-  attribution in `NOTICE`. Never vendor anything whose licence is unknown without
-  saying so in `NOTICE`. Never write a claim into `NOTICE`/`README` that the code
-  no longer satisfies — that happened twice and had to be corrected.
+  NOTE: lint does **not** check `utf8.*` — that is a convention enforced by review,
+  and it exists because the desktop interpreter (stock Lua 5.2.4) lacks `utf8`.
+* **Licence: GPL-2.0, and the library contains ZERO third-party code.** There is
+  no `vendor/` any more. If you ever need a third-party library, that is a
+  decision for the user, not a vendoring detail.
 * **`tests/` is NOT published** (`.gitignore`). The suite protects the local
   developer only. If a guarantee must hold on GitHub, it cannot live only in
   `tests/`.
-* **Install root is `/lib`**, and the manifest is the single source of truth for
-  what ships. Keep `installer.manifest`, `installer.RUNTIME_FILES` and
-  `EXPECTED_FILES` in `tests/installer_spec.lua` IDENTICAL in content and order.
-* **The drift guard has known blind spots.** It scans literal
-  `require("...")`/`pcall(require, "...")`, so it has already missed:
-  1. a require through a VARIABLE,
-  2. a BARE root-level require,
-  3. **data assets read by path** (e.g. `vendor/mplayer-icons/*.lua`) — nothing
-     requires them, so a missing entry ships a broken program silently.
-  When you add a module or an asset, add it to all three lists BY HAND and say so.
+* **Do not add a module without adding it to the file list in `README.md`.** The
+  installer that used to enforce a shipped list is gone, so nothing mechanical
+  checks this now — a module that is not listed simply will not be copied, and the
+  library will be broken for everyone but you.
 
 ---
 
-## 4. WORKING PROTOCOL (the user asked for this to persist)
+## 5. WORKING PROTOCOL
 
-0. **DO NOT COMMIT ANYTHING — not locally, not to a remote.**
-   The user forbade it explicitly, in two steps: first "不许提交到远程仓库"
-   (do not push), then "本地也不行" (local commits are not allowed either).
-   So: **no `git add` + `git commit`, no `git push`, no `git tag`, no stash
-   housekeeping** — leave every change in the working tree for the user to review
-   and commit themselves.
-   Do not treat an uncommitted tree as a problem to fix, and do not suggest
-   committing. Only commit if the user explicitly asks for it, and then only what
-   they name.
-   (This supersedes the earlier instruction in this project, where pushes and
-   local commits WERE requested. Do not carry that assumption forward.)
-1. **Plan agent for anything 2+ steps.** Non-negotiable. It returns a task graph
-   with waves; execute in that order.
+0. **DO NOT COMMIT OR PUSH without an explicit request.** The user revoked this
+   twice ("不许提交到远程仓库", then "本地也不行") before later asking for specific
+   pushes. So: **leave changes in the working tree** and never commit
+   speculatively. Commit only what the user names, only when they ask.
+1. **Plan agent for anything 2+ steps.** It returns a task graph with waves.
 2. **TDD, always.** Write the failing test FIRST, run it, capture the assertion
    message proving it fails for the RIGHT reason. Then the smallest change that
    turns it GREEN. Production code before its failing test = revert and redo.
-3. **Delegate.** Parallelise independent work across agents; one module per lane;
-   never let two lanes touch the same file.
-4. **Evidence, not assertion.** "Tests pass" is the floor, not the ceiling.
-   Capture the literal command output, and for anything user-visible capture the
-   real surface (the emulator, the rendered screen, the HTTP response).
+3. **Delegate.** Parallelise independent work; one module per lane; never let two
+   lanes touch the same file.
+4. **Evidence, not assertion.** "Tests pass" is the floor. Capture literal command
+   output, and for anything user-visible capture the real surface.
 5. **Mutation-test your own tests.** Break the implementation deliberately and
-   confirm the test FAILS. A test that cannot fail proves nothing — this caught a
-   spec whose driver silently recorded nothing after the first test.
-6. **Verify the PUBLISHED state, not just the local tree.** A green local suite
-   proved nothing when the published manifest 404'd. After pushing, probe the live
-   URLs; allow for the CDN's 5-minute cache and re-probe rather than concluding.
+   confirm the test FAILS. This caught a spec whose driver silently recorded
+   nothing after the first assertion.
+6. **Prove equivalence by RUNNING it, not by inspecting it.** When 46 files were
+   minified, my first correctness check compared string literals and was
+   worthless — it counted quotes inside comments, which is exactly what a
+   comment-stripper removes, so every file looked corrupted. The proof that
+   mattered was minifying the whole tree and passing the whole suite on it.
 7. **Correct yourself in the record.** When a claim in `NOTICE`, a doc or a
    ledger entry turns out false, fix the text — do not leave it standing.
 
 ---
 
-## 5. ARCHITECTURE DECISIONS ALREADY MADE (do not relitigate)
+## 6. DECISIONS ALREADY MADE (do not relitigate)
 
-* **UI framework = HKXingluo's BASALT FORK**, not official Basalt. Vendored at
-  `vendor/basalt.lua` (324,622 B, pinned commit `5adef1851b1aba4cd21f566f826a7f0194a24b42`).
-  The fork adds `setImage()` to text elements, which is the ONLY way to render
-  Chinese in a label or button. Official Basalt has zero `setImage` occurrences.
-  Checklist when touching it: `grep -c setImage vendor/basalt.lua` must NOT be 0.
-* **Chinese rendering** = `utf8display` (vendored) + a runtime-fetched CJK font
-  (`ui/cjk.lua`). The font is NOT vendored: 1.68 MB against a default 1 MB disk
-  limit. Failure to get the font must degrade to English, never to garbage.
-* **The installer** is a Basalt GUI (see `installer.lua` + `ui/installer_app.lua`)
-  modelled on MPlayer's `src/install.lua`: bootstrap shim, source choice,
-  async download with a progress bar, then write. It must NEVER overwrite a
-  foreign `/startup.lua` — autostart is ours only, identified by a marker line.
-* **The main program UI is a full replica of MPlayer's**, monitor-based
-  (`setTextScale(0.5)`), with a display-selection page when no monitor exists.
-  The user explicitly chose this over a 51×19 computer-screen layout.
-* **Reuse our own layers where they are already better.** Do NOT port MPlayer's
-  `ImeApi.lua` (166 lines of request/retry plumbing): `net/http.lua` already
-  provides retry with backoff, timeouts, bounded reads and a never-raise
-  contract. Write thin modules on top of it. Same for JSON — use
-  `textutils.serializeJSON`/`unserializeJSON` through an injectable seam, as
-  `net/nbw.lua` does.
-* **Remote keyboard** (`xingluo/cct-keyboard`): the user chose UNCONDITIONAL
-  install + autostart, accepting the risk. That risk is real and must be
-  documented, not hidden: `Keyboard_server.lua` injects ANY rednet message whose
-  protocol matches straight into the local event queue, i.e. anyone on the same
-  rednet can type into the machine. It is NOT vendored — the installer fetches it
-  from upstream at install time, exactly as MPlayer does, which also avoids
-  redistributing a repository that declares no licence.
-* **The IME endpoint is a DEFAULT, not a constant** (the user corrected this).
-  MPlayer reads it from its settings layer and only falls back to
-  `http://rime.liulikeji.cn/query`. Expose it as configurable, with that address
-  as the documented default.
+* **The pipeline is frozen at `decode` / `analyze` / `plan` / `play`.** They are
+  thin pass-throughs: whatever the underlying module returns, the library returns
+  unchanged. Do not wrap or normalise at that level.
+* **Warnings are BARE CODES.** `on_warning(code, args)` — the library never
+  formats a sentence. The prose renderer that used to do this was deleted with the
+  interface, and its absence is the contract.
+* **Pitch is deliberately NOT clamped.** Out-of-range notes go to the speaker as
+  they are; real CC:Tweaked does no validation, and the timbre depends on the
+  user's resource pack. CraftOS-PC rejects them, which is documented in
+  `docs/COMPAT.md` and is an emulator-only divergence — do not "fix" it.
+* **CP1252 conversion is a separate, explicit step.** `nbs/cp1252.lua` is the only
+  place allowed to do it, and only for display.
+* **The clock seam is how time is controlled.** `opts.clock` lets a test run a
+  whole song instantly. Anything time-dependent must go through it.
 
 ---
 
-## 6. HOW TO RUN THINGS
+## 7. HOW TO RUN THINGS
 
 ```text
-lua tests/run.lua           # full suite
-lua tests/lint.lua          # the Cobalt-subset gate; must print "lint: OK"
-lua tests/run.lua tests/ui/foo_spec.lua   # one spec
+lua tests/run.lua                             # full suite
+lua tests/lint.lua                            # the Cobalt-subset gate; must print "lint: OK"
+lua tests/run.lua tests/nbs/decode_spec.lua   # one spec
 ```
 
-The emulator (for anything that must be proven on the real target):
+The emulator, for anything that must be proven on the real target:
 
 ```text
 D:\tools\CraftOS-PC\CraftOS-PC_console.exe --headless -d <data-dir>
@@ -192,8 +167,7 @@ Files handed to it MUST be written **without a BOM** — PowerShell's
 `Set-Content -Encoding UTF8` adds one and CC's Lua rejects it with
 "Unexpected character". Write with Python in binary mode instead.
 
-The user's real test rig: a Minecraft instance at
-`D:\Release 2.7.3\.minecraft\versions\1.21.1-NeoForge_21.1.251`, whose
-`config\computercraft-server.toml` carries a `198.18.0.0/15` allow rule placed
-BEFORE `$private` (the proxy resolves every domain into that range, which
-CC:Tweaked otherwise treats as private and refuses).
+The emulator's speaker rejects pitch outside 0..24; see `docs/COMPAT.md`. The
+user's real test rig additionally needs its `computercraft-server.toml` to allow
+`198.18.0.0/15` before `$private`, because their proxy resolves every domain into
+that range and CC:Tweaked otherwise refuses it as a private address.

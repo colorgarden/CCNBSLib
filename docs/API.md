@@ -1,16 +1,16 @@
 # ccnbs 公共库 API
 
-`ccnbs` 是 CCNBSPlayer 对外的唯一入口模块。其它脚本只需要 `require("ccnbs")`
+`ccnbslib` 是 CCNBSLib 对外的唯一入口模块。其它脚本只需要 `require("ccnbslib")`
 即可完成「解码 → 分析 → 编排 → 播放」全流程，无需了解内部各层的存在。
 
-模块文件位于**项目根目录** `ccnbs.lua`，而不是 `nbs/init.lua`：目标环境的
-`package.path` 不保证包含 `?/init.lua`，但根目录的 `ccnbs.lua` 一定能被
+模块文件位于**项目根目录** `ccnbslib.lua`，而不是 `nbs/init.lua`：目标环境的
+`package.path` 不保证包含 `?/init.lua`，但根目录的 `ccnbslib.lua` 一定能被
 `./?.lua` 这一条默认规则解析到。
 
 ## 快速开始
 
 ```text
-local ccnbs = require("ccnbs")
+local ccnbs = require("ccnbslib")
 ```
 
 `require` 不会访问网络。安装完成后可从全新 shell 直接加载。
@@ -24,6 +24,8 @@ local ccnbs = require("ccnbs")
 | `ccnbs.plan(song, analysis)` | 事件数组（冻结全序 `(tick_index, layer_index, note_index)`） |
 | `ccnbs.play(song\|plan, opts)` | 一个**会话** `session`，立即返回、不阻塞（第一个参数可以是歌曲表，也可以是已编排好的事件数组） |
 | `ccnbs.discover_speakers()` | 已挂载扬声器记录数组（side 升序），调用 `player.speaker.discover` |
+| `ccnbs.cp1252` | CP1252 → UTF-8 显示转换。**唯一**允许做该转换的地方，且只用于显示 |
+| `ccnbs.runtime` | `stop_speakers` / `cleanup`：安全停掉扬声器；另含一个现成的程序框架 |
 | `ccnbs.version` | 版本字符串，例如 `"1.0.0"` |
 
 `decode` / `analyze` / `plan` 是**原样转发**，返回值与直接调用底层模块逐字段一致。
@@ -119,7 +121,7 @@ ccnbs.play(events, { analysis = analysis })   -- 播放已编排好的计划
 一句提示后直接跳过，不会报错。
 
 ```lua
-local ccnbs = require("ccnbs")
+local ccnbs = require("ccnbslib")
 local clock = require("player.clock")
 local speaker = require("player.speaker")
 
@@ -168,7 +170,7 @@ end
 的歌曲文件）：
 
 ```lua
-local ccnbs = require("ccnbs")
+local ccnbs = require("ccnbslib")
 local clock = require("player.clock")
 local speaker = require("player.speaker")
 

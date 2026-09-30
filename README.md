@@ -1,477 +1,232 @@
-# CCNBSPlayer
+# CCNBSLib
 
-在 [CC:Tweaked](https://tweaked.cc/) 电脑上播放 Note Block Studio `.nbs` 歌曲文件的音乐
-播放器。它读取 `.nbs` 乐谱，解码、分析、编排，再通过游戏内的 `speaker` 外设**调度音符**
-发声。本项目**不打包、也不下载任何音频采样**，声音完全由 Minecraft 自己合成。
+在 [CC:Tweaked](https://tweaked.cc/) 电脑上**解析 Note Block Studio `.nbs` 乐谱，
+并可把它调度到 `speaker` 外设上播放**的 Lua 库。
 
-> 当前版本：`1.0.0`。
+**这是一个库，不是程序。** 仓库里没有界面、没有安装器、没有网络客户端——只有
+「字节 → 乐谱 → 分析 → 事件流 → 扬声器调用」这条流水线，以及一个最小的命令行
+播放器用来示范怎么用它。
 
-## 这是什么
+> 版本：`1.0.0`　模块入口：`require("ccnbslib")`
 
-- 解码已发布的 `.nbs` 格式（v0 老格式到 v6）：图层、音符力度/声像/音高、自定义乐器与
-  循环元数据。
-- 加载歌曲时做分析：总音符数、峰值并发、是否需要扩展音域、需要几个扬声器。
-- 把乐谱编排成一条**确定的全序事件流**，按节拍调度到扬声器上，调用
-  `speaker.playNote`（普通音符盒音色）与 `speaker.playSound`（v6 小号类音色）。
-- 当一首歌同一时刻的音符数超过单扬声器上限时，自动把音符**分配到多个扬声器**，并在数量
-  不足时提示需要几个。
+---
 
-**一句话**：它是「音符调度器」，不是「音频播放器」。声音由 Minecraft 自己合成，本项目
-只负责在正确的时刻敲下正确的音符。
+## 快速开始
+
+```lua
+local ccnbs = require("ccnbslib")
+
+-- 1. 读取字节（从哪来由你决定）
+local handle = io.open("song.nbs", "rb")
+local bytes = handle:read("*a")
+handle:close()
+
+-- 2. 解码。它从不抛错，失败以 {ok=false, error={code=...}} 返回。
+local decoded = ccnbs.decode(bytes)
+if not decoded.ok then
+  print("解码失败：" .. decoded.error.code)
+  return
+end
+
+-- 3. 分析 → 编排 → 播放
+local song = decoded.song
+local analysis = ccnbs.analyze(song)
+local events = ccnbs.plan(song, analysis)
+
+local session = ccnbs.play(song, {
+  on_warning = function(code, args)
+    print("WARN[" .. code .. "]")     -- 只给裸码，怎么显示由你决定
+  end,
+  on_progress = function(info)
+    print(string.format("%d/%d", info.index, info.total))
+  end,
+})
+
+-- play 立即返回，不阻塞；自己决定什么时候等
+while session.is_playing() do
+  os.sleep(0.1)
+end
+```
+
+---
 
 ## 环境要求
 
-- 一台 CC:Tweaked 电脑，且**至少连接一个 `speaker` 外设**（贴在电脑任意一侧，用
-  `peripheral.getNames()` 能看到它）。
-- 使用「一键安装」时需要 **HTTP**。好消息是：**两个平台的 HTTP 默认都是开启的**，因此
-  绝大多数用户**无需做任何事**：
-  - **CraftOS-PC 模拟器**：开关是模拟器自己的配置文件 `config/global.json`（位于
-    CraftOS-PC 的**用户数据目录**中）里的 `http_enable` 键，默认 `true`。
-  - **真实 CC:Tweaked 服务器**：开关是服务器配置 `computercraft-server.toml` 里的
-    `http.enabled`，默认 `true`。
+| 用途 | 需要什么 |
+|---|---|
+| 解析（`decode` / `analyze` / `plan`） | **什么都不需要**。纯算术，不碰外设、不碰网络 |
+| 播放（`play`） | 至少一个 `speaker` 外设，贴在电脑任意一侧 |
+| 命令行播放器 `nbsplay` | 一个 speaker + **HTTP**（它要从 URL 取歌） |
 
-若 HTTP 被人为关闭，`wget` 会先失败，安装器也会给出**明确的中文提示**。此时请**直接编辑
-上述配置文件**并**重启**模拟器 / 服务器，然后再重试。
+两个平台的 HTTP 默认都是开启的：
 
-> 注意：实测本项目使用的 CraftOS-PC 2.8.3 构建**会忽略 `-o` / `--option` 启动参数**
-> （实测 `-o maxNotesPerTick=...` 与 `--option` 两种写法均不生效），所以**不要**指望用
-> `-o http_enable=true` 打开 HTTP。那条路走不通，**只有改配置文件并重启才有效**。
+- **CraftOS-PC 模拟器**：`<用户数据目录>/config/global.json` 里的 `http_enable`；
+- **真实 CC:Tweaked 服务器**：`computercraft-server.toml` 里的 `http.enabled`。
+
+> 实测本项目使用的 CraftOS-PC 2.8.3 构建**会忽略 `-o` / `--option` 启动参数**，
+> 所以**不要**指望用 `-o http_enable=true` 打开 HTTP——只有改配置文件并重启才有效。
+
+---
 
 ## 安装
 
-### 方式一：一键安装（推荐）
-
-在电脑的 shell 里运行：
+没有安装器。把这些文件按原目录结构复制到电脑的 `/lib/`：
 
 ```text
-wget run https://raw.githubusercontent.com/colorgarden/CCNBSPlayer/main/installer.lua
-```
-
-安装器会先问你**从哪个来源下载**（见下一节），然后**下载界面框架**，接着弹出一个**图形安装
-界面**（基于 Basalt 2）：
-
-- 顶部标题，中间状态与进度条（带百分比）
-- 一个**来源列表**，可在开始前切换下载源
-- 按钮：`开始安装` → 下载（进度条实时走动）→ `写入` → `重启` / `稍后`
-- 一个 **`开机自启动：开/关`** 开关
-
-下载**全部在内存中完成**，只有你点 `写入` 才会真正落盘，所以中途失败不会留下装了一半的目录。
-安装器是**幂等**的：重复运行会干净地覆盖旧文件，不会破坏既有安装。
-
-> 界面需要图形框架，若框架下载失败，安装器会**自动退回纯文字安装**，不会让你面对一片空白。
-
-> **为什么装得下。** 默认 CC 电脑的磁盘上限是 **1,000,000 字节**，而本项目源码未经压缩
-> 约 **1.03 MB**——直接装会**超出 123 KB**。所以安装器在写入前会**去掉我们自己 Lua 源码
-> 里的注释**（第三方 `vendor/` 原样保留），实测安装后占 **约 720 KB**，留出约 280 KB 给
-> 你自己的歌曲文件。这与参考实现 MPlayer 的做法一致：它的发行包同样是压缩过的，而且它
-> **不安装自己的安装器**。
-
-### 开机自启动（可选）
-
-图形界面里有一个 `开机自启动：开/关` 开关，默认**关**。打开后，安装器会在**根目录**写一个
-`startup.lua` —— CC 会在电脑开机时自动执行它，从而直接进入播放器。
-
-| 情况 | 安装器的行为 |
-|---|---|
-| 根目录没有 `startup.lua`，你选了开 | 写入 |
-| 已有的是**它自己写的**（带标记） | 覆盖（重跑即更新） |
-| 已有的是**你自己的** | **绝不覆盖**，只提示你，让你自己决定怎么合并 |
-| 你选了关，而文件是它写的 | 删除（重跑安装器即可干净关闭自启） |
-| 你选了关，而文件是你自己的 | 不动 |
-
-> **它不会碰别人的 `startup.lua`。** 直接覆盖会毁掉你机器上无关的启动配置，比"没装自启"
-> 严重得多，所以这条是硬规则。
-
-命令行方式（非交互，适合 CI 或脚本）：
-
-| 参数 | 作用 |
-|---|---|
-| `--autostart` | 开启自启（等价于把开关打开） |
-| `--no-autostart` | 关闭自启（仅删除**它自己写的**那个文件） |
-| 都不给 | **不做任何改动** —— "没有表态"不等于"关掉"，所以不会动你已有的自启 |
-
-### 下载来源（镜像源）
-
-安装器**会先让你选下载来源**。引导阶段（此时图形框架还没下载下来）是一个编号菜单：
-
-```text
-请选择下载来源：
-  0. 自动（按顺序尝试，推荐）
-  1. github   https://raw.githubusercontent.com/...
-  2. ghproxy  https://ghproxy.net/...
-  ...
-```
-
-直接回车 = 自动；也可以输入编号或名称。选定后，**整次安装的所有文件都来自这一个来源**，绝不
-东拼一点西拼一点。
-
-进入图形界面后，来源会以**列表**形式显示，你可以在点 `开始安装` **之前**换一个；一旦开始
-下载就锁定。若你在命令行已经用 `--mirror` 指定了来源，则不会再问你，界面里也不能改动。
-
-以下是「自动」模式下按顺序尝试的来源：
-
-| 顺序 | 名称 | 地址 |
-|---|---|---|
-| 1 | `github` | `raw.githubusercontent.com`（官方，**始终最先尝试**） |
-| 2 | `ghproxy` | `ghproxy.net` |
-| 3 | `ghfast` | `ghfast.top` |
-| 4 | `gh-proxy` | `gh-proxy.com` |
-| 5 | `hkproxy` | `hk.gh-proxy.com` |
-| 6 | `llkk` | `gh.llkk.cc` |
-| 7 | `jsdelivr` | `cdn.jsdelivr.net`（**放最后，因为它有缓存**） |
-
-能直连 GitHub 的机器**行为和以前完全一样**，永远用不到镜像，因为官方地址排第一。
-
-**为什么 jsDelivr 排最后**：它是唯一**会缓存**的来源——按分支缓存，可能长达数小时。刚推
-的提交在它上面可能还看不到，过期的清单会让你装到旧文件列表，所以只当最后手段。
-
-需要绕过交互时：
-
-```text
-wget run .../installer.lua --list-mirrors
-wget run .../installer.lua --mirror ghfast
-wget run .../installer.lua --mirror https://自定义镜像/前缀
-wget run .../installer.lua --no-mirror
-```
-
-| 参数 | 作用 |
-|---|---|
-| `--list-mirrors` | 列出所有可用来源后退出，不做安装 |
-| `--mirror <名称>` | **只用**该来源，不再自动回退，也不再询问 |
-| `--mirror <地址>` | 只用该地址（同样不回退） |
-| `--no-mirror` | 只用 GitHub 官方地址，完全不碰镜像 |
-
-> `--mirror` 是「只用它」而不是「优先它」：指定后若该来源不通，会直接失败而不会偷偷换源，
-> 这样你才能确定文件到底从哪来。
-
-### 方式二：手动复制（无 HTTP 时）
-
-把仓库里这些文件按原目录结构复制到电脑的 `/lib/`：
-
-```text
-/lib/ccnbs.lua            （库入口）
-/lib/ccnbsplayer.lua      （交互播放器）
-/lib/updater.lua          （更新器）
-/lib/installer.lua        （安装/更新引擎 + 更新器依赖）
+/lib/ccnbslib.lua         （库入口）
+/lib/nbsplay.lua          （命令行播放器，可选）
 /lib/nbs/*.lua            （10 个解码/分析模块）
-/lib/player/*.lua         （9 个运行时模块）
-/lib/net/*.lua            （3 个网络模块）
-/lib/ui/*.lua             （5 个界面模块）
-/lib/vendor/*.lua         （2 个第三方库，见「许可证」）
+/lib/player/*.lua         （8 个调度/播放模块）
 ```
 
-共 **83 个文件**（含界面模块与 35 个图标）。
+共 20 个文件，约 237 KB（源码未压缩）。
 
-> **手动复制装不进默认磁盘。** 安装器会把**我们自己的 Lua 源码去掉注释**再写入
-> （约 1.03 MB → **约 720 KB**），这样才塞得进默认的 1 MB 磁盘。手动复制是未经压缩
-> 的源码，约 1.03 MB，**会超出上限**。要走手动复制，请先调大
-> computer_space_limit，或只复制你实际需要的模块。
->
-> endor/ 下的第三方源码**不会被压缩**：它的注释承载着署名，改动它会歪曲上游的发布内容。
+### `require` 是怎么解析的（重要）
 
-> 图标是**按路径读取**的（不是 `require`），所以安装清单里的 35 个
-> `vendor/mplayer-icons/*.lua` **一个都不能少**，否则界面会没有图标。
+CC:Tweaked 的 `require` **没有**固定的 `/lib` 搜索根。`package.path` 是
+`?;?.lua;?/init.lua;/rom/modules/main/?;...`，其中 `?` 会**相对于「正在运行的程序
+所在目录」**解析。
 
-> `installer.lua` 也在安装清单里，因为 `/lib/updater` 依赖它的逻辑（这是"更新"与"安装"
-> 不可能给出不同结果的原因）。
+所以 `/lib/` 之所以可用，是因为**整棵库都在 `/lib` 下，且你运行的程序也在
+`/lib` 下**。若你在别处写脚本，需要显式加路径：
 
-> `vendor/` 里是随仓库分发的第三方库（Basalt 2 与 utf8display），**必须一起复制**，否则
-> 播放器无法启动。字体**不在**其中，由程序在运行时自行下载（见下文「中文显示」）。
+```lua
+package.path = "/lib/?.lua;/lib/?/init.lua;" .. package.path
+local ccnbs = require("ccnbslib")
+```
 
-### 安装位置与 `require` 解析规则（重要）
+---
 
-安装根目录是 **`/lib/`**。请务必理解这条规则，否则会踩到 `module not found`：
+## 命令行播放器
 
-- CC:Tweaked 的 `require` **没有**一个固定的 `/lib` 搜索根。它的 `package.path` 是
-  `?;?.lua;?/init.lua;/rom/modules/main/?;...`，其中 `?` 模式会**相对于「正在运行的程序
-  所在目录」**解析。
-- 因此 `/lib/` 之所以可用，是因为**整棵运行时都在 `/lib` 下，且入口程序
-  `ccnbsplayer.lua` 也在 `/lib` 下**。当你运行 `/lib/ccnbsplayer` 时，它的目录是
-  `/lib`，于是 `require("ccnbs")` 找到 `/lib/ccnbs.lua`，`require("nbs.decode")` 找到
-  `/lib/nbs/decode.lua`。
-- 这也正是仓库根目录那个 `ccnbs.lua` 必须与 `ccnbsplayer.lua` 放在**同一个目录**的原因
-  （安装后即都在 `/lib`）。
-- 若你在**别处**写自己的脚本要用这个库，请显式把 `/lib` 加进搜索路径：
-
-  ```lua
-  package.path = "/lib/?.lua;/lib/?/init.lua;" .. package.path
-  local ccnbs = require("ccnbs")
-  ```
-
-## 使用
-
-### 运行播放器
-
-安装后，在 shell 里输入：
+`nbsplay.lua` 是最小示范：**一个直链 → 一首歌 → 一条进度条**。没有播放列表、
+不扫描本地文件、不搜索。
 
 ```text
-lib/ccnbsplayer
+nbsplay https://example.com/song.nbs
 ```
 
-也可以先 `cd lib` 再输入 `ccnbsplayer`。
-
-### 歌曲文件放哪里
-
-把 `.nbs` 文件放到播放器的**当前工作目录**（例如默认的 `/`，或你 `cd` 进去的目录）。
-播放器只在**当前目录**里找 `.nbs`，不会递归子目录。
-
-### 更新
-
-装上以后再想更新，运行**更新器**即可，不需要再记 `wget` 地址：
+它分两个阶段显示进度：
 
 ```text
-/lib/updater
+fetching https://example.com/song.nbs
+  [############------------]  50%  128/256 KiB
+Creeper Chase  842 notes  1:23  2 speaker(s)
+[############----------------]  50%  0:41 / 1:23  note 421/842
+done.
 ```
 
-它会读取本机已安装的版本、从仓库读取版本，**只有仓库更新时才重新安装**；已经是最新则什么都
-不做，也**不会下载任何文件**。更新器完全复用安装器的逻辑（同一份镜像链、同一份清单、同一
-个写入器），因此「更新」和「安装」不可能得出不同结果。
+下载阶段按 8 KiB 分块读取，所以百分比是**真实的字节进度**而不是干等；
+播放阶段从库给出的 `t_ms` 计算，因此节拍不均匀的歌也不会让进度条乱跳。
 
-```text
-/lib/updater --check          # 只报告有没有新版本，不做任何改动
-/lib/updater --mirror ghfast  # 只用一个来源
-/lib/updater --no-mirror      # 只用 GitHub 官方地址
-/lib/updater --list-mirrors   # 列出可用来源
-```
+---
 
-版本号只有**一个来源**：`installer.lua` 里的 `installer.VERSION`。更新器是去抓**远端
-`installer.lua` 源码**并把这一行解析出来比较的，而不是另外维护一个 `version` 文件——多一个
-版本文件就多一处会过期的地方，而过期的版本号会让更新器自信地给出错误结论。测试里有一条断言
-专门锁住这件事：解析安装在机器上的 `installer.lua` 得到的版本，必须等于它自己报告的版本。
+## 公共 API
 
-版本比较是**按数字**而不是按字符串，所以 `1.10.0` 正确地**新于** `1.9.0`。如果你装的是比仓
-库**更超前**的本地/开发构建，更新器会识别出来并**拒绝降级**，什么都不改。
-
-### 界面
-
-界面是**参考实现 MPlayer 的完整复刻**：基于 Basalt 2，画在**显示器**上。
-
-```text
-┌──── 侧边栏 17 宽 ────┬──────── 顶栏（返回/前进/搜索/关于/设置）────────┐
-│ CCNBSPlayer          │                                                 │
-│ 主页   发现   随机    │              内容区                           │
-│ 帮助                 │                                                 │
-│ 收藏   下载   最近    │                                                 │
-├──────────────────────┴─────────────────────────────────────────────────┤
-│ 进度条（可点击跳转）  曲名                      播放/暂停 上一首 下一首 │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-| 屏幕 | 内容 |
+| 调用 | 返回 |
 |---|---|
-| **主页** | 问候语 + 本机 `.nbs` + 来自 Note Block World 的精选 + 最近播放 |
-| **发现** | 两个标签页：最新 / 最热（走 NBW 的排序参数） |
-| **随机** | 换一种排序的列表——NBW 没有真正的「随机」接口 |
-| **搜索** | 搜 Note Block World 的歌曲 |
-| **帮助** | 按键、显示器要求、**无线键盘风险**、第三方致谢 |
-| **收藏 / 下载 / 最近** | 本机存储的收藏、已下载、播放历史 |
-| **歌曲详情** | 标题、作者、**许可证**、**归属**、播放、下载 |
-| **设置** | 语言、网络（NBW 与输入法地址）、显示、音频、外观、关于、更新 |
+| `ccnbslib.decode(bytes)` | `{ok=true, song=...}` 或 `{ok=false, error={code=, msg=}}`。**从不抛错** |
+| `ccnbslib.analyze(song)` | 总音符数、峰值并发、所需扬声器数、是否超出原生音域等 |
+| `ccnbslib.plan(song, analysis)` | 事件数组，按冻结全序 `(tick, layer, note)` 排列 |
+| `ccnbslib.play(song\|plan, opts)` | 会话对象；立即返回，不阻塞 |
+| `ccnbslib.discover_speakers()` | 已挂载扬声器记录数组（按 side 升序） |
+| `ccnbslib.cp1252` | CP1252 → UTF-8 显示转换，把曲名/图层名显示给人看 |
+| `ccnbslib.runtime` | 安全停掉扬声器，以及一个现成的程序框架（库不拥有事件循环，由你决定） |
+| `ccnbslib.version` | `"1.0.0"` |
 
-> **需要显示器。** 界面用 `setTextScale(0.5)` 画在显示器上——这正是多分区布局能塞下的
-> 原因。**没接显示器时，程序会先显示一个「请选择显示器」页面**，选定后自动重启。这是
-> 参考实现的行为，本项目照做。
+`decode` / `analyze` / `plan` 是**原样转发**，返回值与直接调用底层模块逐字段一致。
 
-### 按键
+### 会话对象
 
-| 操作 | 按键 |
+| 成员 | 说明 |
 |---|---|
-| 在列表中上下移动 | ↑ / ↓ |
-| 播放选中歌曲 | `Enter` |
-| 播放 / 暂停 | 空格 或 `p` |
-| 停止 | `s` 或 `q` |
-| 步进跳转 | ← / → |
-| 退出 | `Esc` |
+| `session.cancel()` | 停止播放；幂等。会补发被推迟的 `custom-instrument` 警告 |
+| `session.is_playing()` | 还有事件未播完且未被取消时为 `true` |
+| `session.stats()` | 调度统计，原样透传 |
+| `session.analysis` / `.plan` / `.assignment` | 本次播放用的分析、事件与分配结果 |
 
-> **空格、S 和左右方向键是全局键**：即使你正在搜索框里打字，它们也会作用于播放。
-> 只有正在编辑设置项时才会让位。
+### `play` 的接缝（全部可选）
 
-### 中文与搜索
+生产环境什么都不传，用真实外设与真实时钟；测试注入即可完全确定：
 
-搜索框支持**拼音输入**：输入拼音（如 `niha`）→ 回车 → 从候选里选。这需要联网访问一个
-**外部查询服务**，地址**在设置里可改**（默认 `http://rime.liulikeji.cn/query`，与参考
-实现一致），也可以整个关掉——关掉后搜索框只能用英文字母。
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `opts.analysis` | — | **传计划（事件数组）时必填**，否则抛 `E_PLAN_REQUIRES_ANALYSIS` |
+| `opts.speakers` | `discover_speakers()` | 扬声器记录数组 |
+| `opts.clock` | `player.clock.new_os()` | 时钟（测试可注入虚拟时钟，瞬间播完） |
+| `opts.on_warning` | — | `function(code, args)`，**每个不同的码至多一次** |
+| `opts.on_event` | — | `function(event)`，每个到期事件在派发**之前**调用 |
+| `opts.on_progress` | — | `function(info)`，`info = { t_ms, index, total }` |
 
-界面中文走 `utf8display` + **运行时获取的像素字体**（约 1.68 MB，比默认电脑的整个磁盘上限
-还大，所以不随仓库分发）。**取不到字体时界面退回英文**，而不是显示乱码。
+---
 
-### Note Block World
+## 警告码
 
-歌曲搜索和下载来自 [Note Block World](https://noteblock.world)。下载会以 `.nbs` 文件写到
-当前工作目录。
+库**只交裸码**，不管显示——怎么呈现由调用方决定。每个码在一首歌里至多出现一次。
 
-**每首歌有自己的许可证**，界面上会显示：
+| 码 | 触发时机 | `args` |
+|---|---|---|
+| `extended-range` | 播放开始时（加载期属性） | `{min_key, max_key}` |
+| `speakers` | 播放开始时（由扇出分配决定） | `{peak, required, found, dropped}` |
+| `custom-instrument` | 播放结束或取消时汇总 | `{count}` |
+| `play-sound-pitch` | 播放到对应音符时 | `{}` |
+| `tempo-clamp` | 歌曲自身节拍细于 50 ms 计时粒度时 | `{}` |
 
-- `Standard` —— **仅限个人收听**，不允许再分发或用于发布作品；
-- `CC BY-SA` —— 允许在**署名**前提下二次使用。
+---
 
-**本项目从不打包任何歌曲。** 下载前会显示作者署名与歌曲页面链接。
+## 关于 CP1252
 
-部分歌曲在服务器上是压缩存放的（ZIP），这类歌曲会**明确报错并指向歌曲页面**，而不是尝试
-在电脑上解压。
+NBS **v0–v5 把每个字符串存成一字节一个字符的 CP1252**，不是 UTF-8。读取器把这些
+字节**原样保留**——自定义乐器的音效文件路径依赖这份保真度。
 
-### 开机自启动
+所以「把曲名显示给人看」是**一个单独的、显式的步骤**：
 
-安装器里有一个 `开机自启动：是 / 否` 的选择，默认**否**。选「是」后会在**根目录**写一个
-`startup.lua` —— CC 会在开机时执行它。
-
-**它绝不会覆盖别人的 `startup.lua`。** 直接覆盖会毁掉你机器上无关的启动配置，比「没装自启」
-严重得多，所以：
-
-| 情况 | 行为 |
-|---|---|
-| 没有 `startup.lua`，你选了「是」 | 写入 |
-| 已有的是**它自己写的**（带标记） | 覆盖 |
-| 已有的是**你自己的** | **不动**，只提示 |
-| 你选了「否」，文件是它写的 | 删除 |
-| 你选了「否」，文件是你自己的 | 不动 |
-
-`/lib/updater` 更新时**不会**改动自启状态：没给参数就等于「没有表态」，不是「关掉」。
-
-### ⚠️ 无线键盘的安全提示（请务必看）
-
-安装器会**无条件安装**一个无线键盘服务端（`/Keyboard_server.lua`，从上游获取，不随仓库
-分发），并在 `/startup.lua` 里让它**开机后台运行**。这是参考实现的行为，你选择了照做。
-
-**它的工作方式是：把任何协议名匹配的红网消息，直接注入本机的按键事件队列。**
-
-这意味着：
-
-> **同一红网上的任何人都能向这台电脑打字** —— 包括按键、鼠标点击和粘贴文本。
-
-- 在**私人存档**里，这正是它的用途：用掌上电脑当大屏的无线键盘；
-- 在**公共服务器**上，这等于给每台机器开了一个**远程控制通道**。
-
-不想担这个风险的话：删掉 `/Keyboard_server.lua`，并删掉 `/startup.lua` 里对应那一行；
-或者干脆不要给电脑装无线调制解调器。
-
-### 扬声器数量要求
-
-**同时发声的音符越多，需要的扬声器越多。** 一个 CC:T 扬声器每个游戏 tick 最多接受
-**8 次** `playNote`；一次 `playSound`（v6 小号类音色）则独占一整个 tick。播放器会在
-加载时算出所需数量，不足时给出形如下面的提示：
-
-```text
-WARN[speakers] 本曲峰值 <peak> 音符/50ms，需要 <required> 个扬声器，实际 <found> 个，已丢弃 <dropped> 个音符
+```lua
+local shown = ccnbs.cp1252.to_display(song.header.name)
 ```
 
-按提示增加扬声器即可消除丢音。所需数量由公式
-`ceil(峰值香草音符数 / 8) + 峰值小号音符数` 给出。
+`ccnbslib.cp1252` 是**唯一**允许做这个转换的地方。它**从不修改输入**，只返回一个
+新的显示字符串；五个 CP1252 未定义字节映射到 `U+FFFD`。
 
-### 扩展音域提醒（需要材质包）
-
-NBS 音符的**原生两个八度**对应 key `33..57`。当一首歌使用了该范围**之外**的音符时，
-播放器会提示：
-
-```text
-WARN[extended-range] 本曲含超出原生两个八度的音符（key ...），需安装扩展音域材质包才能听到完整音色
-```
-
-播放器**不会夹取**音高：超出原生范围的音符会**原样**送进扬声器。真实 CC:Tweaked 会原样
-接受这些音高（最终音色取决于客户端安装的扩展音域材质包），所以此时需要**自行安装社区
-提供的扩展音域材质包**才能听到完整音色。本项目不提供、也不自动安装材质包。
-
-一个必须知道的行为差异：**CraftOS-PC 模拟器比游戏更严**，会对 0..24 之外的音高直接报错。
-这是「模拟器比游戏更严」的单侧分歧，不是项目缺陷。
-
-## 警告代码参考
-
-所有警告都用同一种**机器可识别标记**呈现：`WARN[<code>] <中文说明>`，由
-`player/warnings.lua` 渲染；交互播放器会把它打印出来。库入口 `ccnbs` 只把**裸代码**交给
-`opts.on_warning(code, args)`，自己不打印。**每个代码在一首歌里至多出现一次。**
-
-| 代码 | 触发时机 | 含义（`args`） | 你该怎么办 |
-|---|---|---|---|
-| `WARN[speakers]` | 播放开始时（由扇出分配决定） | 本曲峰值并发超过现有扬声器能承载的量，部分音符被丢弃。`{peak, required, found, dropped}` | 把扬声器增加到 `required` 个 |
-| `WARN[extended-range]` | 播放开始时（加载期属性，不是播放中途） | 曲中含原生两个八度（key `33..57`）之外的音符。`{min_key, max_key}` | 自行安装社区扩展音域材质包；真实 CC:Tweaked 会原样接受越界音高 |
-| `WARN[custom-instrument]` | 播放结束或取消时汇总 | 曲中含 `.nbs` 自定义乐器；这些音符**被拒绝播放并跳过**（没有任何扬声器调用）。`{count}` | 无需操作；**自定义乐器不会发声**，属预期行为 |
-| `WARN[play-sound-pitch]` | 播放到对应音符时 | v6 小号类音色（`speaker.playSound`）的音高超出可表示范围（0.5..2.0），被夹取为近似值 | 接受近似音高；属已知限制 |
-| `WARN[tempo-clamp]` | **歌曲自身的节拍**细于 50 ms 计时粒度时，一次性 | 曲目的 tick 间隔本身比 CC:Tweaked 计时器的 0.05 s（50 ms）粒度更细 | 接受轻微的节拍量化；属已知限制 |
-
-> `WARN[tempo-clamp]` 只描述**歌曲自身节拍**快于 20 tps（即 `tick_ms < 50`）的情况，
-> **不是**给和弦或第一拍发的。普通的同刻音符（和弦）与第一拍都不会触发它。
+---
 
 ## 明确不做的事
 
-- **不打包、不播放音频采样**，不使用 DFPWM / PCM 之类的音频接口。本项目只调度音符调用，
-  声音由 Minecraft 合成。
-- **不播放自定义乐器**（`.nbs` 内自带的自定义乐器）。遇到时跳过并一次性提示。
-- **v1 不支持**跳转进度（seek）与循环播放。
-- 不修改 Minecraft、不修改服务端，也不会替你安装材质包。
+- **不打包、不做音频采样解码。** 没有 DFPWM / PCM。声音由 Minecraft 自己合成，
+  这个库只负责在正确的时刻敲下正确的音符。
+- **不播放自定义乐器。** `.nbs` 内自带的自定义乐器会被拒绝并跳过（有警告码）。
+- **不支持跳转进度（seek）与循环。** `play` 一次播到底，只能 `cancel`。
+- **不访问网络。** `require("ccnbslib")` 不碰网络；只有命令行播放器 `nbsplay`
+  会去下载你给的那个直链。
+- **没有界面。** 这是库。
 
-## 库 API
+---
 
-除了交互播放器，本项目还提供一个可 `require` 的库入口，位于**项目根目录** `ccnbs.lua`
-（不是 `nbs/init.lua`）：
+## 平台差异
 
-```lua
-local ccnbs = require("ccnbs")        -- 需先把 /lib 加进 package.path，见上文
+[`docs/COMPAT.md`](docs/COMPAT.md) 记录了实测的平台行为差异，其中最重要的一条：
 
-ccnbs.version                         -- "1.0.0"
-ccnbs.decode(bytes)                   -- 解码：返回「包装表」，不是歌曲本身（见下）
-ccnbs.analyze(song)                   -- 分析
-ccnbs.plan(song, analysis)            -- 编排为有序事件数组
-ccnbs.discover_speakers()             -- 已挂载的扬声器
-ccnbs.play(song|plan, opts)           -- 播放：立即返回，不阻塞；可传歌曲表或事件数组
-```
+> **CraftOS-PC 模拟器对 `playNote` 的音高只接受 0..24，越界直接抛错；真实
+> CC:Tweaked 根本不校验音高。** 这是「模拟器比游戏更严」的单侧分歧。
 
-**`decode` 返回的是一个「包装表」，不是歌曲本身**。请先判断 `.ok`，再取 `.song`：
+因此本库**刻意不夹取音高**：超出原生范围的音符**原样**送进扬声器，最终音色取决于
+客户端安装的扩展音域材质包。模拟器上跑越界音高的歌会报错——那是模拟器的限制，
+不是库的缺陷。
 
-```lua
-local ccnbs = require("ccnbs")
+---
 
--- 把 "my_song.nbs" 替换成你自己的歌曲文件
-local file = io.open("my_song.nbs", "rb")
-if file == nil then
-  print("未找到 my_song.nbs，请替换成你自己的歌曲文件后再运行本示例。")
-  return
-end
-local bytes = file:read("*a")
-file:close()
+## 文档
 
-local result = ccnbs.decode(bytes)
--- 成功：result = { ok = true,  song = <歌曲表> }
--- 失败：result = { ok = false, error = { code = "E_...", msg = ... } }
+| 文件 | 用途 |
+|---|---|
+| [`docs/API.md`](docs/API.md) | 公共 API 参考：接缝注入、返回值形状、错误码 |
+| [`docs/COMPAT.md`](docs/COMPAT.md) | 平台兼容性实测记录与探测方法 |
 
-if not result.ok then
-  print("解码失败：" .. tostring(result.error.code))
-  return
-end
-
-local song = result.song              -- play 要的是 song，不是 result
-local analysis = ccnbs.analyze(song)
-local events = ccnbs.plan(song, analysis)
-ccnbs.play(song, {})                  -- 只传歌曲表 song
-```
-
-`play` 的**第一个参数既可以是一首歌，也可以是一份已编排好的计划**（`ccnbs.plan` 返回的
-事件数组）。传计划时还必须再传 `opts.analysis`（即 `ccnbs.analyze(song)`），否则会抛出
-类型化错误 `E_PLAN_REQUIRES_ANALYSIS`：
-
-```lua
--- song 为上一示例中解码得到的歌曲表
-local analysis = ccnbs.analyze(song)
-local events = ccnbs.plan(song, analysis)
-ccnbs.play(events, { analysis = analysis })   -- 播放已编排好的计划
-```
-
-`decode` **从不抛错**，错误一律以 `{ok = false, error = {code = ...}}` 返回。`analyze` /
-`plan` / `play` 接纳的都是**歌曲表**（`result.song`），把整个包装表 `result` 直接传给它们
-会失败，所以**必须先检查 `.ok`**。完整说明与可运行示例见 [`docs/API.md`](docs/API.md)。
+---
 
 ## 许可证
 
-本项目以 **GNU 通用公共许可证第 2 版（GPL-2.0）** 发布，完整条款见
-[`LICENSE`](LICENSE)。第三方组件及其归属信息见 [`NOTICE`](NOTICE)。
+以 **GNU 通用公共许可证第 2 版（GPL-2.0）** 发布，完整条款见 [`LICENSE`](LICENSE)。
+第三方组件及其归属见 [`NOTICE`](NOTICE)。
 
-**本项目包含第三方代码。** 用户界面基于 **Basalt 2**（MIT），中文渲染使用
-**utf8display**（自身未声明许可证，经 **MPlayer**（GPL-2.0）分发），两者都**随仓库
-分发**在 [`vendor/`](vendor/) 目录下，来源、固定版本与重新构建方法见
-[`vendor/README.md`](vendor/README.md)。之所以是随仓库分发而非运行时下载，是因为 Basalt
-内部模块之间用 `require` 互相引用，散放文件时无法解析。
-
-**字体不属于仓库内容**：CJK 像素字体由 `ui/cjk.lua` 在运行时下载到用户的电脑上（原因见
-下文「中文显示」），这与 MPlayer 的做法一致。
-
-`.nbs` 测试素材属于各自独立的第三方作品，仍按其原有许可证（MIT）授权，不适用本项目的
-GPL-2.0；它们不随仓库分发。
+本库的全部实现均为从零编写，**不含任何第三方代码**。

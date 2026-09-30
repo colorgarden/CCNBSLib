@@ -1,6 +1,6 @@
 -- nbs/cp1252.lua
 --
--- CP1252 (Windows-1252) -> UTF-8 display mapping for CCNBSPlayer.
+-- CP1252 (Windows-1252) -> UTF-8 display mapping for CCNBSLib.
 --
 -- WHY THIS MODULE EXISTS
 --   NBS v0-v5 store every string as one byte per character in CP1252, NOT

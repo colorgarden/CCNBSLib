@@ -1,8 +1,8 @@
 -- SPDX-License-Identifier: GPL-2.0-only
 -- Copyright (C) 2026 colorgarden
--- Part of CCNBSPlayer. Licensed under GPL-2.0; see LICENSE.
+-- Part of CCNBSLib. Licensed under GPL-2.0; see LICENSE.
 --
--- ccnbs.lua
+-- ccnbslib.lua
 --
 -- THE PUBLIC LIBRARY MODULE -- the single entry point other people's scripts
 -- `require`.  Everything below is a thin, non-blocking composition of the
@@ -12,11 +12,11 @@
 -- WHY THIS FILE IS AT THE PROJECT ROOT (and not nbs/init.lua)
 -- ---------------------------------------------------------------------------
 -- `package.path` on the target is not guaranteed to contain `?/init.lua`, so a
--- package-style `nbs/init.lua` may not be found.  A root-level `ccnbs.lua`
+-- package-style `nbs/init.lua` may not be found.  A root-level `ccnbslib.lua`
 -- resolves under the plain `./?.lua` pattern, which IS guaranteed.
 --
 -- FROZEN PUBLIC INTERFACE
---   local ccnbs = require("ccnbs")
+--   local ccnbs = require("ccnbslib")
 --
 --   ccnbs.decode(bytes)        -> nbs.decode.decode(bytes)
 --   ccnbs.analyze(song)        -> nbs.analyze.analyze(song)
@@ -98,6 +98,8 @@ local clock_module = require("player.clock")
 local dispatch_module = require("player.dispatch")
 local fanout_module = require("player.fanout")
 local tempo_module = require("player.tempo")
+local cp1252_module = require("nbs.cp1252")
+local runtime_module = require("player.runtime")
 
 local ccnbs = {}
 
@@ -109,6 +111,18 @@ ccnbs.version = "1.0.0"
 ccnbs.decode = decode_module.decode
 ccnbs.analyze = analyze_module.analyze
 ccnbs.plan = plan_module.plan
+
+-- ccnbs.cp1252 -- NBS v0-v5 store every string as CP1252, one byte per character,
+-- and the reader keeps those bytes BYTE-EXACT because a custom instrument's
+-- sound-file path depends on that fidelity.  Converting them so a human can read
+-- a song or layer name is therefore a SEPARATE, explicit step, and this is the
+-- single place that conversion is allowed to happen.  Parsing, not presentation.
+ccnbs.cp1252 = cp1252_module
+
+-- ccnbs.runtime -- stopping speakers safely, and a ready-made program frame for a
+-- caller that does not want to write its own event loop.  A LIBRARY does not own
+-- the loop -- the caller does -- so this is offered rather than required.
+ccnbs.runtime = runtime_module
 
 -- ccnbs.discover_speakers() -> ascending-side array of speaker records.  Lets a
 -- caller pre-check how many speakers exist before calling play().

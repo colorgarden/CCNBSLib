@@ -72,7 +72,7 @@
 -- song without the dispatcher knowing anything about printing.
 --
 -- TWO LEDGER LAYERS -- BOTH DELIBERATE, NOT DUPLICATES.  The public player
--- (ccnbs.lua) does NOT call d:warnings() or d:reset(); it keeps its OWN
+-- (ccnbslib.lua) does NOT call d:warnings() or d:reset(); it keeps its OWN
 -- once-per-code aggregate and forwards each bare code ONCE to its
 -- opts.on_warning callback.  This dispatcher's ledger is a separate, lower
 -- layer: it guarantees per-instance once-only semantics for any DIRECT user of

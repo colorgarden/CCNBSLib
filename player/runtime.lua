@@ -13,7 +13,7 @@
 -- so the program gets to stop its speakers before it unwinds.  This module owns
 -- that discipline in ONE place, so the player core never has to remember it.
 --
--- FROZEN PUBLIC INTERFACE (ccnbs.lua and player/tui.lua build on these EXACT
+-- FROZEN PUBLIC INTERFACE (ccnbslib.lua builds on these EXACT
 -- names):
 --
 --   local runtime = require("player.runtime")

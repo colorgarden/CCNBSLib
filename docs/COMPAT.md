@@ -242,7 +242,7 @@ playSound 又发别的声音」）**对 CraftOS-PC 正确，对现代 CC:T 偏�
 以下为**逐字复制**的原始输出：
 
 > 说明：下方 `PROBE methods=...` 一行列出了仿真扬声器**对外暴露的全部方法**（平台能力清单），
-> 其中包含 `playAudio` 等音频缓冲接口。**本项目不使用这些接口**——CCNBSPlayer 属于
+> 其中包含 `playAudio` 等音频缓冲接口。**本项目不使用这些接口**——CCNBSLib 属于
 > 音符调度方案，只调用 `playNote` / `playSound`。此处保留原文仅为记录平台 API 表面。
 
 ```
@@ -399,7 +399,7 @@ STATUS ok
   - `has_extended_range` = 任一 `key < 33 or key > 57`（第 133-135 行）；同时给出 `min_key/max_key`。
 - `player/fanout.lua`：`fanout.play` **不检查** `result.error_message`（第 330-339 行）；
   该事件既不计 `calls_made`、也不计 `refused`、也不计 `dropped` ⇒ **静默丢失**。
-- `ccnbs.lua`：`on_event` 里拿到 `dispatcher:event(...)` 后**只看 `warning_code`**，**不看 `error_message`**
+- `ccnbslib.lua`：`on_event` 里拿到 `dispatcher:event(...)` 后**只看 `warning_code`**，**不看 `error_message`**
   （第 197-205 行）⇒ 经 `ccnbs.play` 时越界音符**静默丢音、无任何运行期提示**；
   但 `has_extended_range` 会在播放**开始时**发一次 `"extended-range"` 警告（第 141-146 行）。
 - 录制脚本（本地 harness）：`on_event` 里 `if result.error_message ~= nil then error(...)`（第 311-313 行）
@@ -456,14 +456,14 @@ key_histogram=27x1,29x2,32x2,34x1,36x3,38x2,39x36,43x1,46x1
 ### 选项 2：dispatch 兜底——越界抛错时改用可表示的音高重试（如八度折叠到 0..24），并告警
 - **用户听到**：音符**能听见但音高被移调**（折叠到原生八度）；真实 CC:T 上**不会触发**（不抛错），故不影响游戏内表现。
 - **既有警告是否足够**：不够，需**新增**一个警告码（如 `pitch-folded`/`emulator-pitch`），且只在真的折叠时发一次。
-- **要改的代码面**：`player/dispatch.lua`（捕获 `error_message` 后重试）+ 新警告码 + `ccnbs.lua` 的警告聚合 + 文档。
+- **要改的代码面**：`player/dispatch.lua`（捕获 `error_message` 后重试）+ 新警告码 + `ccnbslib.lua` 的警告聚合 + 文档。
 - **风险**：**改变了 Tier-2 录制**——同一事件的 `playNote` 参数会与 `plan` 不一致，破坏「plan vs 录制逐行比对」；
   且「模拟器上移调、真机不移调」本身就是新的分歧面。实现复杂度最高。
 
 ### 选项 3：跳过该音符并告警（安全降级）
 - **用户听到**：音符**不发声**（与今天 `ccnbs.play` 的静默丢失**听觉上相同**），但会**明确告警**「某些音符超出扬声器可表示范围，已跳过」。
 - **既有警告是否足够**：`extended-range` 说了「装材质包」，但**没说是模拟器限制**；建议把它细化为两个码或带 reason。
-- **要改的代码面**：`player/dispatch.lua`（或 `ccnbs.lua`）把 `error_message` 转成一个警告码；文档。
+- **要改的代码面**：`player/dispatch.lua`（或 `ccnbslib.lua`）把 `error_message` 转成一个警告码；文档。
 - **风险**：最低且**不改变真实 CC:T 行为**（真机不抛，永不触发）；但仍无法在 Tier-2 断言「这些音符被播放」。
 
 ### 选项 4：在 mapping 层夹取到 0..24（**推翻既有产品决定**）
