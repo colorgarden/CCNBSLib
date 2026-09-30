@@ -56,8 +56,12 @@ local function try(ok, value)
   return nil
 end
 
-local ccnbs = try(pcall(require, "ccnbslib"))
-local runtime = try(pcall(require, "player.runtime"))
+-- The DEFAULTS.  Written as `pcall(require, "literal")` so a dependency
+-- scan can see them, and held in locals the seam accessors below can
+-- override -- a pipeline that cannot be driven from a test has only
+-- compile-level assurance, and that is the gap this closes.
+local default_ccnbs = try(pcall(require, "ccnbslib"))
+local default_runtime = try(pcall(require, "player.runtime"))
 
 -- ---------------------------------------------------------------------------
 -- Pure parts -- these are what the spec drives, because they are the parts where
@@ -183,6 +187,24 @@ local function clock_sleep(seconds)
   end
 end
 
+-- library() -> the ccnbslib table, injected or the real one.  EVERY use in
+-- run() goes through here, so a test can supply a fake library: no speakers,
+-- no clock, no waiting, and the whole path becomes assertable.
+local function library()
+  if type(seams.ccnbs) == "table" then
+    return seams.ccnbs
+  end
+  return default_ccnbs
+end
+
+-- runtime_module() -> player.runtime, injected or the real one.
+local function runtime_module()
+  if type(seams.runtime) == "table" then
+    return seams.runtime
+  end
+  return default_runtime
+end
+
 -- ---------------------------------------------------------------------------
 -- Output
 -- ---------------------------------------------------------------------------
@@ -227,9 +249,13 @@ function cli.fetch(url, on_progress)
     return nil, "could not reach the server"
   end
 
+  -- The response handle's methods are COLON-STYLE: `self` is passed
+  -- explicitly. Calling them dot-style puts the first argument into
+  -- `self` and breaks -- see the header comment.
   local total = nil
   if type(response.getResponseHeaders) == "function" then
-    local headers_ok, headers = pcall(response.getResponseHeaders)
+    local headers_ok, headers =
+      pcall(response.getResponseHeaders, response)
     if headers_ok and type(headers) == "table" then
       total = tonumber(headers["Content-Length"] or headers["content-length"])
     end
@@ -238,7 +264,7 @@ function cli.fetch(url, on_progress)
   local chunks = {}
   local received = 0
   while true do
-    local read_ok, chunk = pcall(response.read, 8192)
+    local read_ok, chunk = pcall(response.read, response, 8192)
     if not read_ok then
       pcall(response.close, response)
       return nil, "the download was interrupted"
@@ -268,6 +294,8 @@ end
 function cli.run(argv, opts)
   opts = type(opts) == "table" and opts or {}
   local write_line = opts.write or make_writer()
+  local lib = library()
+  local rt = runtime_module()
   local line = function(text)
     write_line(tostring(text or ""))
   end
@@ -280,7 +308,7 @@ function cli.run(argv, opts)
     return 1
   end
 
-  if ccnbs == nil then
+  if lib == nil then
     line("ccnbslib.lua is missing; the library is not installed.")
     return 1
   end
@@ -301,7 +329,7 @@ function cli.run(argv, opts)
   end
 
   line("decoding...")
-  local decoded = ccnbs.decode(body)
+  local decoded = lib.decode(body)
   if type(decoded) ~= "table" or decoded.ok ~= true then
     local code = type(decoded) == "table" and decoded.error
       and decoded.error.code or "unknown"
@@ -310,17 +338,17 @@ function cli.run(argv, opts)
   end
 
   local song = decoded.song
-  local analysis = ccnbs.analyze(song)
-  local events = ccnbs.plan(song, analysis)
+  local analysis = lib.analyze(song)
+  local events = lib.plan(song, analysis)
   local duration = cli.duration_ms(events)
 
   -- A title if the file has one, so a user can tell whether they got the song
   -- they meant to.  CP1252 bytes are converted for DISPLAY only, which is what
   -- the library's converter is for; the song itself keeps its bytes.
   local title = type(song.header) == "table" and song.header.name or nil
-  if type(title) == "string" and title ~= "" and ccnbs.cp1252 ~= nil
-    and type(ccnbs.cp1252.to_display) == "function" then
-    local ok, shown = pcall(ccnbs.cp1252.to_display, title)
+  if type(title) == "string" and title ~= "" and lib.cp1252 ~= nil
+    and type(lib.cp1252.to_display) == "function" then
+    local ok, shown = pcall(lib.cp1252.to_display, title)
     if ok and type(shown) == "string" then
       title = shown
     end
@@ -329,7 +357,7 @@ function cli.run(argv, opts)
     title = "(untitled)"
   end
 
-  local speakers = ccnbs.discover_speakers()
+  local speakers = lib.discover_speakers()
   local found = type(speakers) == "table" and #speakers or 0
 
   line(string.format("%s  %d notes  %s  %d speaker(s)",
@@ -339,7 +367,7 @@ function cli.run(argv, opts)
     return 1
   end
 
-  local session = ccnbs.play(events, {
+  local session = lib.play(events, {
     analysis = analysis,
     speakers = speakers,
     on_progress = function(info)
@@ -373,8 +401,8 @@ function cli.run(argv, opts)
 
   -- Speakers are stopped on EVERY path, including this one, because a speaker
   -- left playing keeps sounding after the program ends.
-  if runtime ~= nil and type(runtime.cleanup) == "function" then
-    pcall(runtime.cleanup, speakers, session)
+  if rt ~= nil and type(rt.cleanup) == "function" then
+    pcall(rt.cleanup, speakers, session)
   end
   line("done.")
   return 0
