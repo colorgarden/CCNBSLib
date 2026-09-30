@@ -130,6 +130,28 @@ end
 -- object.  CC:Tweaked's speaker exposes camelCase playNote / playSound / stop;
 -- this maps the seam's snake_case methods onto them and forwards the boolean
 -- return of playNote/playSound unchanged (refusals must reach the caller).
+--
+-- THE PERIPHERAL'S METHODS TAKE NO `self` -- CALL THEM DOT-STYLE.
+--
+-- This is the same convention issue AGENTS.md section 3 records for the http
+-- response handle, and getting it wrong here was a real, silent defect: every
+-- note was passed as `playNote(peripheral_object, name, volume, pitch)`, so
+-- `instrumentA` received a TABLE instead of the instrument name. The speaker
+-- throws "Invalid instrument" for that, dispatch contains the raise in a pcall,
+-- and playback therefore advanced normally through the whole song in total
+-- silence -- the progress bar was right and nothing was audible.
+--
+-- The evidence, not a guess:
+--   * the Java signature is
+--       public final boolean playNote(ILuaContext context, String instrumentA,
+--                                     Optional<Double> volumeA, Optional<Double> pitchA)
+--     and ILuaContext is INJECTED, not a Lua argument, so from Lua the method
+--     takes exactly (instrument, volume, pitch);
+--   * CC:Tweaked's own usage is `speaker.playSound("entity.creeper.primed")`.
+--
+-- Contrast the RECORDS this returns: those ARE Lua tables whose methods take
+-- `self` and are called with a colon (`record:play_note(...)`). Two conventions in
+-- one module, and the seam boundary is exactly where they change.
 function speaker.wrap(side, peripheral_object)
   if type(peripheral_object) ~= "table" then
     error(string.format(
@@ -141,17 +163,20 @@ function speaker.wrap(side, peripheral_object)
 
   function record.play_note(self, name, volume, pitch)
     local fn = require_method(peripheral_object, side, "playNote", "play_note")
-    return fn(peripheral_object, name, volume, pitch)
+    -- DOT call: no self. See the note above.
+    return fn(name, volume, pitch)
   end
 
   function record.play_sound(self, name, volume, pitch)
     local fn = require_method(peripheral_object, side, "playSound", "play_sound")
-    return fn(peripheral_object, name, volume, pitch)
+    -- DOT call: no self.
+    return fn(name, volume, pitch)
   end
 
   function record.stop(self)
     local fn = require_method(peripheral_object, side, "stop", "stop")
-    return fn(peripheral_object)
+    -- DOT call: no self.
+    return fn()
   end
 
   return record
