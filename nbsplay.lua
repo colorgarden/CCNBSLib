@@ -211,6 +211,22 @@ end
 -- One line is rewritten in place rather than scrolling, because a progress bar
 -- that scrolls is just a log.  Everything goes through `emit` so a test can
 -- capture the exact strings.
+--
+-- EVERY FAILURE PATH PRINTS `E_CODE: detail`.  The project's convention is
+-- that machine-readable output is a BARE CODE and the caller words it -- the
+-- library returns `{code = "E_..."}` and never a sentence.  The CLI follows
+-- the same rule so a script can branch on the code, and so the codes are
+-- stable enough to assert on.  All ASCII, all greppable:
+--
+--   E_USAGE          no usable URL on the command line
+--   E_NO_LIBRARY     ccnbslib.lua is not installed
+--   E_HTTP_DISABLED  this computer has no http API
+--   E_HTTP           the request itself failed
+--   E_DOWNLOAD       reading the response failed part way
+--   E_EMPTY          the server answered with nothing
+--   E_DECODE         the library rejected the bytes (its code follows)
+--   E_NO_SPEAKER     no speaker peripheral is attached
+--   E_PLAY           the library returned no usable session
 
 local function make_writer()
   local term = terminal()
@@ -233,29 +249,41 @@ end
 -- Fetching
 -- ---------------------------------------------------------------------------
 
--- cli.fetch(url, on_progress) -> body | nil, error
+-- cli.fetch(url, on_progress) -> body | nil, code, detail
 --
 -- Reads in chunks so the caller can show a percentage.  A response with no
 -- Content-Length simply reports progress without a total, which is why
 -- `on_progress` receives `(received, total)` and total may be nil.
+--
+-- THE HANDLE'S METHODS TAKE NO `self` -- call them DOT-STYLE.
+--
+-- CC:Tweaked registers them with @LuaFunction on Java methods that have no
+-- self parameter (HttpResponseHandle.java), and the ROM's own example is
+-- `request.readAll()`.  Measured on CraftOS-PC against a FILE handle, which the
+-- response handle's javadoc says shares its methods and which uses the same
+-- machinery:
+--
+--     h.read(5)      -> "01234"   five characters           -- correct
+--     h.read(h, 5)   -> "0"       the table became the count -- wrong
+--
+-- So passing the handle back in makes `read` receive a table where a number
+-- belongs.  On real CC:Tweaked that raises, and the caller sees a failed
+-- download -- which is precisely what happened when this was written the other
+-- way round.
 function cli.fetch(url, on_progress)
   local api = http_api()
   if type(api) ~= "table" or type(api.get) ~= "function" then
-    return nil, "HTTP is disabled on this computer"
+    return nil, "E_HTTP_DISABLED", "HTTP is disabled on this computer"
   end
 
   local ok, response = pcall(api.get, url)
   if not ok or response == nil then
-    return nil, "could not reach the server"
+    return nil, "E_HTTP", "the request failed"
   end
 
-  -- The response handle's methods are COLON-STYLE: `self` is passed
-  -- explicitly. Calling them dot-style puts the first argument into
-  -- `self` and breaks -- see the header comment.
   local total = nil
   if type(response.getResponseHeaders) == "function" then
-    local headers_ok, headers =
-      pcall(response.getResponseHeaders, response)
+    local headers_ok, headers = pcall(response.getResponseHeaders)
     if headers_ok and type(headers) == "table" then
       total = tonumber(headers["Content-Length"] or headers["content-length"])
     end
@@ -264,10 +292,10 @@ function cli.fetch(url, on_progress)
   local chunks = {}
   local received = 0
   while true do
-    local read_ok, chunk = pcall(response.read, response, 8192)
+    local read_ok, chunk = pcall(response.read, 8192)
     if not read_ok then
-      pcall(response.close, response)
-      return nil, "the download was interrupted"
+      pcall(response.close)
+      return nil, "E_DOWNLOAD", "the download was interrupted"
     end
     if chunk == nil or chunk == "" then
       break
@@ -278,11 +306,11 @@ function cli.fetch(url, on_progress)
       pcall(on_progress, received, total)
     end
   end
-  pcall(response.close, response)
+  pcall(response.close)
 
   local body = table.concat(chunks)
   if #body == 0 then
-    return nil, "the server returned nothing"
+    return nil, "E_EMPTY", "the server returned nothing"
   end
   return body
 end
@@ -300,8 +328,9 @@ function cli.run(argv, opts)
     write_line(tostring(text or ""))
   end
 
-  local url, err = cli.parse_url(argv)
+  local url, parse_error = cli.parse_url(argv)
   if url == nil then
+    line("E_USAGE: " .. tostring(parse_error))
     local first, second = cli.usage()
     line(first)
     if second then line(second) end
@@ -309,22 +338,25 @@ function cli.run(argv, opts)
   end
 
   if lib == nil then
-    line("ccnbslib.lua is missing; the library is not installed.")
+    line("E_NO_LIBRARY: ccnbslib.lua is missing; the library is not "
+      .. "installed.")
     return 1
   end
 
   line("fetching " .. url)
-  local body, fetch_error = cli.fetch(url, function(received, total)
-    local text = string.format("  %d KiB", math.floor(received / 1024))
-    if total ~= nil and total > 0 then
-      text = string.format("  [%s] %3d%%  %d/%d KiB",
-        cli.render_bar(received / total, 24), cli.percent(received / total),
-        math.floor(received / 1024), math.floor(total / 1024))
-    end
-    line(text)
-  end)
+  local body, fetch_code, fetch_detail = cli.fetch(url,
+    function(received, total)
+      local text = string.format("  %d KiB", math.floor(received / 1024))
+      if total ~= nil and total > 0 then
+        text = string.format("  [%s] %3d%%  %d/%d KiB",
+          cli.render_bar(received / total, 24),
+          cli.percent(received / total),
+          math.floor(received / 1024), math.floor(total / 1024))
+      end
+      line(text)
+    end)
   if body == nil then
-    line("download failed: " .. tostring(fetch_error))
+    line(tostring(fetch_code) .. ": " .. tostring(fetch_detail))
     return 1
   end
 
@@ -333,7 +365,9 @@ function cli.run(argv, opts)
   if type(decoded) ~= "table" or decoded.ok ~= true then
     local code = type(decoded) == "table" and decoded.error
       and decoded.error.code or "unknown"
-    line("this is not a readable .nbs file (" .. tostring(code) .. ")")
+    -- The library's OWN typed code is passed through, not restated: it is
+    -- the machine-readable half of the contract.
+    line("E_DECODE: " .. tostring(code))
     return 1
   end
 
@@ -363,7 +397,8 @@ function cli.run(argv, opts)
   line(string.format("%s  %d notes  %s  %d speaker(s)",
     title, analysis.total_notes or 0, cli.format_time(duration), found))
   if found == 0 then
-    line("no speaker attached; attach one to a side of the computer and retry.")
+    line("E_NO_SPEAKER: attach a speaker to a side of the computer and "
+      .. "retry.")
     return 1
   end
 
@@ -389,7 +424,7 @@ function cli.run(argv, opts)
   })
 
   if type(session) ~= "table" then
-    line("playback could not start.")
+    line("E_PLAY: the library did not return a playback session")
     return 1
   end
 

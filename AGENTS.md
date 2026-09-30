@@ -78,8 +78,41 @@ Never from an API field, a cache, or memory. Measured examples:
 | raw CDN right after a push | Served the OLD file for ~5 min (`max-age=300`) |
 | A size difference vs upstream | Was CRLF, not a stale artifact — I blamed upstream first |
 | `total * 0.69` as a shrink estimate | Real ratio was 0.54; the estimate was pessimistic, not safer |
+| A DELETED file's calling convention | The live API's: it took no `self` |
 
 **Rule: read the file, run the probe, or compare a hash. Then state the method.**
+
+### The calling convention, specifically — it cost a broken release
+
+CC:Tweaked registers a handle's methods with `@LuaFunction` on Java methods that
+have **no `self` parameter**:
+
+```java
+@LuaFunction
+public final Object[] getResponseCode() { ... }
+@LuaFunction
+public final Map<String, String> getResponseHeaders() { ... }
+```
+
+So they are called **dot-style**: `response.read(8192)`, `response.readAll()`,
+`response.close()`. Passing the handle back in — `response.read(response, 8192)` —
+sends a table where a count belongs, which on a real computer raises and surfaces
+as a failed download.
+
+I got this wrong by trusting this project's own **deleted** `net/http.lua`, which
+passed `self` explicitly. Whether that ever worked is beside the point: it was not
+the authority, and it was not on the machine any more.
+
+Measured on CraftOS-PC against a FILE handle, which the response handle's javadoc
+says shares its methods and which uses the same machinery:
+
+```text
+h.read(5)      -> "01234"   five characters            correct
+h.read(h, 5)   -> "0"       the table became the count  wrong
+```
+
+`tests/nbsplay_spec.lua` now ENFORCES this: its fake response refuses an extra
+leading argument, so passing `self` fails the suite. Verified by mutation.
 
 ---
 
