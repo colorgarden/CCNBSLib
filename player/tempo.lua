@@ -243,11 +243,21 @@ function Tempo:_warn_once()
   end
 end
 
--- _schedule_next(): queue the next event's one-shot callback on the clock.
+-- _schedule_next(): arm ONE timer for the next event not yet dispatched.
 --
 -- The delay is ALWAYS (ideal - now), recomputed from the cumulative ideal
 -- timeline -- never tick_ms added to a previous delay.  This is the anti-drift
 -- rule in action.
+--
+-- ONE TIMER PER DEADLINE, NOT PER EVENT.  When this timer fires, EVERY event
+-- whose ideal time has arrived is dispatched together (see _on_fire).  The clock
+-- can only advance in whole world ticks (0.05 s -- see the header), so a song
+-- denser than 20 events per second CANNOT give each event a timer of its own.
+-- Chaining one timer per event did exactly that, and pinned playback to 20
+-- events/second: a real 148 events/second song therefore ran ~7.5x SLOW, measured
+-- at 1087 s of wall clock for a 143 s song.  Grouping by deadline is what lets a
+-- dense song play at its real tempo, and it costs nothing when events are sparse
+-- -- such a song simply drains one event per firing, exactly as before.
 function Tempo:_schedule_next()
   if self.cancelled then
     return
@@ -277,16 +287,6 @@ function Tempo:_schedule_next()
     }, 0)
   end
 
-  -- B2: whether an event is "clamped" is a property of the song's NOMINAL
-  -- tempo, never of this delay.  A zero/negative delay simply means the event
-  -- is due now (the first note, or a chord's later notes) and is NOT counted.
-  -- In a genuinely sub-granularity song every scheduled event counts, because
-  -- the clock cannot represent the requested tempo at all.
-  if self.clamp_active then
-    self.metrics.clamped_ticks = self.metrics.clamped_ticks + 1
-    self:_warn_once()
-  end
-
   local self_ref = self
   -- DOT call: clock methods take no explicit self (see header).
   self.handle = self.clock.after(delay_ms / 1000, function()
@@ -294,41 +294,90 @@ function Tempo:_schedule_next()
   end)
 end
 
--- _on_fire(): one event's deadline was reached.
+-- _on_fire(): a deadline was reached -- dispatch every event that is now due.
 --
--- Progress (index, tick count, drift, end times) is updated and the NEXT event
--- is queued BEFORE the user callback runs, so a raising on_event is captured by
--- the clock and cannot stop playback.
+-- Three phases, in this order, and each order is load-bearing:
+--
+--   A. TAKE every event whose ideal time has arrived, advancing the index and
+--      recording the metrics as each is taken.
+--   B. ARM the next timer from the ideal timeline -- BEFORE running any user
+--      callback.  This is why taking and dispatching are separate steps: the
+--      chain must be intact before on_event can raise, or a single bad callback
+--      would stall every remaining event in the song.
+--   C. DISPATCH the events that were taken.
+--
+-- Each callback is pcall'd individually so that one raising note cannot discard
+-- the OTHER notes that share its deadline.  The first raise is re-thrown at the
+-- end, so the clock still captures exactly one error and playback continues --
+-- the same observable contract as before.
 function Tempo:_on_fire()
   if self.cancelled then
     return
   end
-  local index = self.index
-  if index > #self.events then
-    return
-  end
 
-  local event = self.events[index]
-  local ideal = self.start_ms + event.t_ms
   local actual = self.clock.now_ms()
-  local drift = math.abs(actual - ideal)
-  if drift > self.metrics.max_drift_ms then
-    self.metrics.max_drift_ms = drift
+
+  -- A. Take the next event UNCONDITIONALLY, then every further event now due.
+  --
+  -- Taking the FIRST unconditionally is what GUARANTEES PROGRESS, and it is not a
+  -- convenience -- it is required.  A firing can arrive a hair EARLY: the clock
+  -- rounds its requested delay, and a positive delay can round to ZERO steps, so
+  -- the callback runs at the very instant it was armed.  A plain "is this event
+  -- due?" guard takes nothing in that case, and the chain then re-arms the same
+  -- deadline at the same instant -- forever.  Consuming one event per firing bounds
+  -- the number of firings by the number of events.
+  --
+  -- The per-event scheduler this replaced behaved the same way: whatever deadline
+  -- fired, that event was dispatched.  An event may therefore fire up to one
+  -- rounding step early, and max_drift_ms reports that honestly.
+  local due = {}
+  while self.index <= #self.events do
+    local event = self.events[self.index]
+    local ideal = self.start_ms + event.t_ms
+    if #due > 0 and ideal > actual then
+      break
+    end
+
+    local drift = math.abs(actual - ideal)
+    if drift > self.metrics.max_drift_ms then
+      self.metrics.max_drift_ms = drift
+    end
+
+    self.index = self.index + 1
+    self.metrics.ticks_scheduled = self.metrics.ticks_scheduled + 1
+    if self.index > #self.events then
+      self.metrics.ideal_end_ms = ideal
+      self.metrics.actual_end_ms = actual
+    end
+
+    -- B2: whether an event is "clamped" is a property of the song's NOMINAL
+    -- tempo, never of this delay.  A zero/negative delay simply means the event
+    -- is due now (the first note, or a chord's later notes) and is NOT counted.
+    -- In a genuinely sub-granularity song every DISPATCHED event counts, because
+    -- the clock cannot represent the requested tempo at all.
+    if self.clamp_active then
+      self.metrics.clamped_ticks = self.metrics.clamped_ticks + 1
+      self:_warn_once()
+    end
+
+    due[#due + 1] = event
   end
 
-  self.index = index + 1
-  self.metrics.ticks_scheduled = self.metrics.ticks_scheduled + 1
-  if index == #self.events then
-    self.metrics.ideal_end_ms = ideal
-    self.metrics.actual_end_ms = actual
-  end
-
-  -- Queue the next event from the ideal timeline BEFORE on_event: this bounds
-  -- drift and keeps playback alive even if on_event raises.
+  -- B. Arm the next deadline before dispatching anything.
   self:_schedule_next()
 
+  -- C. Dispatch, one pcall each, re-throwing the first raise.
   if self.run_callback ~= nil then
-    self.run_callback(event)
+    local first_error = nil
+    for index = 1, #due do
+      local ok, err = pcall(self.run_callback, due[index])
+      if not ok and first_error == nil then
+        first_error = err
+      end
+    end
+    if first_error ~= nil then
+      error(first_error, 0)
+    end
   end
 end
 
