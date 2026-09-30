@@ -53,12 +53,38 @@
 -- ---------------------------------------------------------------------------
 -- CC:T ADAPTER ROUNDING CAVEAT
 -- ---------------------------------------------------------------------------
--- The adapter maps onto CC:Tweaked primitives:
---     now_ms()            = os.epoch("ingame")          -- integer ms
---     after(delay, fn)    = os.startTimer(delay)        -- timer id
---     run_due()           = os.pullEvent("timer") drain
---     sleep_until(d_ms)   = os.sleep(max(0, d_ms - now_ms()) / 1000)
---                           (an adapter affordance; NOT used by tempo.lua)
+  -- The adapter maps onto CC:Tweaked primitives:
+  --     now_ms()            = os.epoch("utc")              -- integer ms
+  --     after(delay, fn)    = os.startTimer(delay)        -- timer id
+  --     run_due()           = os.pullEvent("timer") drain
+  --     sleep_until(d_ms)   = os.sleep(max(0, d_ms - now_ms()) / 1000)
+  --                           (an adapter affordance; NOT used by tempo.lua)
+  --
+  -- now_ms USES os.epoch("utc"): REAL wall-clock milliseconds, the only clock
+  -- here that is both millisecond-resolution and impossible for the world to
+  -- distort. Both other candidates were measured and both are wrong in a way that
+  -- is SILENT:
+  --
+  --   os.epoch("ingame")  the IN-GAME day clock. With doDaylightCycle OFF it does
+  --                       not move at all -- measured on a real machine, pinned at
+  --                       109436400 for an entire run -- so `delay = ideal - now`
+  --                       stops being an interval and becomes each event's own
+  --                       absolute t_ms, compounding until a 143 s song never
+  --                       ends. With the cycle ON, OSAPI.java computes it as
+  --                       `day * 86400000 + time * 3600000` and a Minecraft day is
+  --                       20 real minutes, so it advances 72000 ms per real second:
+  --                       72x too fast, and every event is instantly overdue.
+  --
+  --   os.clock()          computer uptime -- `clock * 0.05` in OSAPI.java, the very
+  --                       same per-tick counter os.startTimer measures in. Perfectly
+  --                       coherent with the timers, but it advances in whole 50 ms
+  --                       ticks, so a delay carries up to one tick of quantisation
+  --                       error on top of the timer's own rounding. Kept as the
+  --                       fallback for a build without os.epoch.
+  --
+  -- Note that NEITHER improves the achievable timing: os.startTimer rounds to the
+  -- nearest 0.05 s regardless, so 50 ms is the floor either way. utc is chosen for
+  -- being uncorruptible by the world, not for its resolution.
 --
 -- CAVEAT: os.startTimer rounds its delay UP to the next 0.05 s (one world
 -- tick) boundary, so the adapter's wake-ups are only APPROXIMATE -- a timer
@@ -257,8 +283,31 @@ function clock.new_os()
     return count
   end
 
+  -- now_ms(): milliseconds of REAL time, on a clock the world cannot distort.
+  -- See the long note near the top of this file for why utc is first and what
+  -- each alternative got wrong; the short version is that a frozen or scaled
+  -- clock makes every delay wrong WITHOUT RAISING, which is the worst failure
+  -- mode for a scheduler.
   function adapter.now_ms()
-    return os.epoch("ingame")
+    if type(os) == "table" then
+      -- FIRST CHOICE: real wall-clock milliseconds. Cannot freeze (the daylight
+      -- cycle does not touch it) and cannot be scaled.
+      if type(os.epoch) == "function" then
+        local ok, value = pcall(os.epoch, "utc")
+        if ok and type(value) == "number" then
+          return value
+        end
+      end
+      -- FALLBACK: computer uptime in seconds -- the same per-tick counter the
+      -- timers use, quantised to 50 ms.
+      if type(os.clock) == "function" then
+        local ok, seconds = pcall(os.clock)
+        if ok and type(seconds) == "number" then
+          return seconds * 1000
+        end
+      end
+    end
+    return 0
   end
 
   function adapter.after(delay_sec, fn)
