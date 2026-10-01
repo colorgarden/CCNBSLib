@@ -7,6 +7,11 @@
 .omo/
 .codegraph/
 
+# AGENTS.md is agent material, not a deliverable. It stays on the developer's disk
+# (the agent reads it), but it must never be published: remove it from the index with
+# `git rm --cached AGENTS.md` if it ever reappears, and this line then keeps it out.
+AGENTS.md
+
 # ---------------------------------------------------------------------------
 # CraftOS-PC scratch data (headless test runs use --directory <fresh-tmp>).
 # ---------------------------------------------------------------------------
