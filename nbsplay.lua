@@ -835,8 +835,36 @@ local function make_writer()
     info_row = 1
   end
 
-  -- 下一条永久行写在哪（1 起算）。大于 log_bottom 表示「需要先滚动」。
-  local log_row = 1
+  -- 第一条永久行写在哪（1 起算）；大于 log_bottom 表示「需要先滚动」。
+  --
+  -- **从光标的下一行开始，不是从第 1 行、也不覆盖光标所在的那一行。**
+  --
+  -- 程序启动时屏幕上往往已经有内容：`wget run` 留下了 shell 自己的输出，而用户是在提示符
+  -- 后面敲的 `nbsplay <url>`——命令就在光标那一行上。直接 `setCursorPos(1, 1)` 会把它们
+  -- 全部压掉（真机上实测到的重叠就是这么来的），而清掉光标那一行又会把用户刚敲的命令擦掉。
+  --
+  -- 所以：移到下一行；已经在最后一行则先滚动，把已有内容整体推上去。两者都不破坏已有输出。
+  local here = 1
+  if type(term.getCursorPos) == "function" then
+    local ok, _, row = pcall(term.getCursorPos)
+    if ok and type(row) == "number" and row > 0 then
+      here = row
+    end
+  end
+
+  local log_row = here + 1
+  if log_row > log_bottom then
+    -- 没有空行可用了：滚动一行腾出位置。光标先落到可写区的最后一行，再 scroll(1)，
+    -- 于是原有内容整体上移一行、而底部空出一行。
+    term.setCursorPos(1, log_bottom)
+    if type(term.scroll) == "function" then
+      term.scroll(1)
+    end
+    log_row = log_bottom
+  end
+  term.setCursorPos(1, log_row)
+  term.clearLine()
+
   -- 已经画过实时行吗？清与重画都以它为准，不必每次去读光标位置。
   local live = false
 
