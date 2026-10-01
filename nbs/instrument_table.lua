@@ -1,73 +1,64 @@
 -- nbs/instrument_table.lua
 --
--- Maps an NBS instrument id to the EXACT call the CC:Tweaked speaker must make.
+-- 把 NBS 乐器 id 映射成 CC:Tweaked 扬声器**必须**发出的那次精确调用。
 --
--- This module answers ONE question: "which call, with which name?".  It owns no
--- volume and no pitch -- player/mapping.lua owns those -- so a caller can pair
--- the name returned here with its own volume/pitch arguments.
+-- 本模块只回答一个问题：「发哪种调用、名字是什么」。它不持有音量、也不持有音高
+-- ——那些归 player/mapping.lua——所以调用方可以拿这里的名字搭配自己的音量/音高参数。
 --
--- FROZEN PUBLIC INTERFACE (later layers depend on the exact shapes)
---   instrument_table.PLAY_NOTE_NAMES    array of the 16 legacy names;
---                                       index i (1..16) == instrument id (i-1)
+-- 冻结的公共接口（后续层依赖这些精确形状）
+--   instrument_table.PLAY_NOTE_NAMES    16 个旧乐器名的数组；
+--                                       下标 i（1..16）== 乐器 id（i-1）
 --   instrument_table.PLAY_NOTE_COUNT    16
---   instrument_table.play_note_name(id)   -> name string, or nil outside 0..15
---   instrument_table.play_sound_name(id)  -> sound-event string, or nil
+--   instrument_table.play_note_name(id)   -> 名字字符串；0..15 之外为 nil
+--   instrument_table.play_sound_name(id)  -> 音效事件字符串，或 nil
 --   instrument_table.bucket_of(id, vanilla_instrument_count)
---     -> "vanilla" | "play_sound" | "custom"   (the ONE classifier)
+--     -> "vanilla" | "play_sound" | "custom"   （**唯一**的分类器）
 --   instrument_table.resolve(id, vanilla_instrument_count)
---     -> { kind = "play_note",  name = <one of the 16> }
+--     -> { kind = "play_note",  name = <16 个之一> }
 --     |  { kind = "play_sound", name = "minecraft:block.note_block.<...>" }
---     |  { kind = "custom",     custom_index = <integer> }
+--     |  { kind = "custom",     custom_index = <整数> }
 --
--- ONE OWNER FOR THE CLASSIFICATION
---   bucket_of is the single classifier; resolve() maps its answer to a call,
---   and nbs/analyze.lua calls it for its instrument buckets.  Re-implementing
---   the rule anywhere else is how analyze and resolve previously disagreed for
---   vanilla counts 10 and 17..19 -- under-budgeting speakers for v6 trumpets
---   and inventing a bogus "speakers" warning for legacy custom ids.
+-- 分类只有**一个**归属处
+--   bucket_of 是唯一的分类器；resolve() 把它的答案映射成一次调用，nbs/analyze.lua
+--   则用它来切自己的乐器桶。在别处重新实现这条规则，正是当初 analyze 与 resolve 在
+--   vanilla 计数为 10 和 17..19 时**互相不一致**的原因——那会给 v6 小号少算扬声器，
+--   并为一个旧格式的自定义 id 凭空报出 "speakers" 警告。
 --
--- MISSING vanilla_instrument_count
---   A nil (or otherwise non-numeric) count is treated as the documented default
---   of 16 -- the v1..v5 boundary: ids 0..15 are vanilla, ids 16+ are custom.
---   Neither bucket_of nor resolve ever raises on it, and it is exactly how
---   analyze already classified a missing count, so the modules stay in step on
---   malformed input too.
+-- vanilla_instrument_count 缺失时
+--   nil（或其他任何非数值）按文档默认值 16 处理——即 v1..v5 的边界：id 0..15 是
+--   vanilla，id 16+ 是自定义。bucket_of 与 resolve 都不会因此抛错，而这正是 analyze
+--   早已对缺失计数所做的分类，所以两个模块即便面对畸形输入也保持一致。
 --
--- WHY ids 16..19 ARE playSound-ONLY
---   speaker.playNote accepts EXACTLY the 16 names in PLAY_NOTE_NAMES and THROWS
---   on any other string.  The Minecraft 26/26.1 trumpet note-block sounds
---   (NBS ids 16..19) are NOT in that set, so passing them to playNote would
---   raise inside the game.  They are therefore reached only through
---   speaker.playSound with a full sound-event id.  Keeping them OUT of
---   PLAY_NOTE_NAMES is precisely what prevents the in-game throw.
+-- 为什么 id 16..19 是 **playSound 专属**
+--   speaker.playNote 只接受 PLAY_NOTE_NAMES 里那**恰好** 16 个名字，其他任何字符串都
+--   会**抛错**。Minecraft 26/26.1 的小号音符盒音效（NBS id 16..19）**不在**那个集合
+--   里，所以把它们交给 playNote 会在游戏内抛错。它们因此只能通过 speaker.playSound
+--   配一个完整的音效事件 id 到达。把它们挡在 PLAY_NOTE_NAMES **之外**，正是防止游戏内
+--   抛错的关键。
 --
--- WHY THE FILE'S vanilla_instrument_count DECIDES TRUMPET-vs-CUSTOM
---   Whether ids 16..19 mean "v6 trumpet" or "first custom instrument" depends
---   ONLY on the count in the file's own header, never on the id alone:
---     * A v6 file declares 20 -> ids 16..19 are vanilla trumpets (playSound)
---       and ids 20+ are custom.
---     * A v5 file declares 16 -> ids 16..19 are ALREADY custom (custom_index
---       0..3).  Treating them as trumpets would invent sounds the file never
---       referenced.
---   The custom test (`id >= vanilla_instrument_count`) must therefore run
---   FIRST, before the trumpet lookup.  Inverting that order is the subtle bug
---   this module exists to avoid.
+-- 为什么「小号还是自定义」由**文件自己的** vanilla_instrument_count 决定
+--   id 16..19 是「v6 小号」还是「第一个自定义乐器」，**只**取决于该文件自己 header 里
+--   那个计数，绝不只看 id：
+--     * v6 文件声明 20 -> id 16..19 是 vanilla 小号（playSound），id 20+ 是自定义。
+--     * v5 文件声明 16 -> id 16..19 **本来就是**自定义（custom_index 0..3）。把它们
+--       当成小号，会凭空造出文件从未引用过的音效。
+--   所以自定义判定（`id >= vanilla_instrument_count`）必须**先**跑，在小号查表之前。
+--   把顺序倒过来，正是本模块存在的理由所要避免的那个隐蔽 bug。
 --
--- NAME ASYMMETRIES THAT ARE DELIBERATE, NOT TYPOS
---   * id 4 is `hat` (the NBS UI labels it "Click").
---   * id 2 is `basedrum`, spelled as ONE word; id 3 is `snare`.
---   Verified against tryashtar/nbs-functions nbsreader/Model.cs
---   (GetInstrumentName) and koca2000/NoteBlockAPI getSoundNameByInstrument,
---   which both map 2 -> basedrum and 3 -> snare (the swapped chart is wrong).
+-- 那些刻意为之、**不是**拼写错误的名称不对称
+--   * id 4 是 `hat`（NBS 界面里把它叫作 "Click"）。
+--   * id 2 是 `basedrum`，**一个词**；id 3 是 `snare`。
+--   已对 tryashtar/nbs-functions 的 nbsreader/Model.cs（GetInstrumentName）与
+--   koca2000/NoteBlockAPI 的 getSoundNameByInstrument 核实，两者都把 2 -> basedrum、
+--   3 -> snare（那张把两者掉换的对照表是错的）。
 --
--- TARGET INTERPRETER
---   Stock Lua 5.2 / CC:Tweaked Cobalt: no utf8.*, no bitwise operators, no
---   integer division, no os.exit.
+-- 目标解释器
+--   原版 Lua 5.2 / CC:Tweaked Cobalt：不用 utf8.*、不用位运算、不用整除、不用 os.exit。
 
 local instrument_table = {}
 
--- The 16 names speaker.playNote accepts, indexed so that
--- PLAY_NOTE_NAMES[id + 1] is the name for instrument id `id` (0..15).
+-- speaker.playNote 接受的 16 个名字，下标这样排：PLAY_NOTE_NAMES[id + 1] 就是乐器
+-- id `id`（0..15）对应的名字。
 local PLAY_NOTE_NAMES = {
   "harp",           -- id 0
   "bass",           -- id 1
@@ -87,8 +78,7 @@ local PLAY_NOTE_NAMES = {
   "pling",          -- id 15
 }
 
--- The four v6 trumpet sound events, keyed directly by id 16..19.  These are
--- playSound-only (see the module header).
+-- 四个 v6 小号音效事件，直接按 id 16..19 索引。它们是 playSound 专属（见文件头）。
 local PLAY_SOUND_NAMES = {
   [16] = "minecraft:block.note_block.trumpet",
   [17] = "minecraft:block.note_block.trumpet_exposed",
@@ -96,14 +86,14 @@ local PLAY_SOUND_NAMES = {
   [19] = "minecraft:block.note_block.trumpet_oxidized",
 }
 
--- The number of legacy playNote ids (0..15).
+-- 旧 playNote id 的数量（0..15）。
 local PLAY_NOTE_COUNT = 16
 
 instrument_table.PLAY_NOTE_NAMES = PLAY_NOTE_NAMES
 instrument_table.PLAY_NOTE_COUNT = PLAY_NOTE_COUNT
 
--- play_note_name(id) -> the playNote name, or nil when `id` is not in 0..15.
--- Never throws: a caller may probe any id (e.g. an out-of-range note) safely.
+-- play_note_name(id) -> playNote 名字；`id` 不在 0..15 时为 nil。
+-- 从不抛错：调用方可以安全地探测任意 id（例如某个越界音符）。
 function instrument_table.play_note_name(id)
   if type(id) == "number" and id >= 0 and id <= 15 then
     return PLAY_NOTE_NAMES[id + 1]
@@ -111,8 +101,8 @@ function instrument_table.play_note_name(id)
   return nil
 end
 
--- play_sound_name(id) -> the trumpet sound-event id, or nil.  Only ids 16..19
--- have a playSound form; the legacy ids are playNote-only and return nil here.
+-- play_sound_name(id) -> 小号音效事件 id；否则 nil。只有 id 16..19 有 playSound
+-- 形式；旧 id 是 playNote 专属，这里返回 nil。
 function instrument_table.play_sound_name(id)
   if type(id) == "number" and id >= 16 and id <= 19 then
     return PLAY_SOUND_NAMES[id]
@@ -120,18 +110,17 @@ function instrument_table.play_sound_name(id)
   return nil
 end
 
--- The boundary assumed when a caller supplies no usable vanilla instrument
--- count (nil, or any other non-number).  The v1..v5 layout (16 vanilla
--- instruments, ids 16+ custom) is the legacy default, and it matches analyze's
--- historical treatment of a missing count, so the two modules agree.
+-- 调用方没有给出可用的 vanilla 乐器计数（nil，或其他任何非数值）时所假定的边界。
+-- v1..v5 布局（16 个 vanilla 乐器，id 16+ 自定义）是旧格式的默认值，也与 analyze 历来
+-- 对缺失计数的处理一致，所以两个模块的判断相同。
 local DEFAULT_VANILLA_INSTRUMENT_COUNT = 16
 
--- The id of the last vanilla v6 trumpet (16..19).  Kept beside the classifier:
--- it is the only numeric boundary the classifier itself owns.
+-- 最后一个 vanilla v6 小号的 id（16..19）。放在分类器旁边：这是分类器自己持有的
+-- 唯一数值边界。
 local PLAY_SOUND_MAX_ID = 19
 
--- vanilla_count(vanilla_instrument_count) -> a number usable by the boundary
--- tests.  A missing/non-numeric count falls back to the documented default.
+-- vanilla_count(vanilla_instrument_count) -> 一个可供边界比较使用的数值。
+-- 缺失/非数值的计数回退到文档默认值。
 local function vanilla_count(vanilla_instrument_count)
   if type(vanilla_instrument_count) == "number" then
     return vanilla_instrument_count
@@ -140,48 +129,45 @@ local function vanilla_count(vanilla_instrument_count)
 end
 
 -- bucket_of(instrument_id, vanilla_instrument_count) -> "vanilla" |
--- "play_sound" | "custom".  THE single owner of the classification rule; both
--- analyze.lua and resolve() call it, so they can never drift apart.
+-- "play_sound" | "custom"。分类规则的**唯一**归属处；analyze.lua 与 resolve()
+-- 都调它，所以两者永远不会跑偏。
 --
--- ORDER MATTERS.  The custom check runs FIRST against the file's own vanilla
--- count, so a v5 file (count 16) classifies ids 16..19 as custom instead of
--- trumpets.  Only ids below the vanilla boundary can be legacy notes or v6
--- trumpets.
+-- 顺序很重要。自定义判定先跑，比对的是**文件自己的** vanilla 计数，所以 v5 文件
+-- （计数 16）会把 id 16..19 分类成自定义、而不是小号。只有低于 vanilla 边界的 id
+-- 才可能是旧音符或 v6 小号。
 function instrument_table.bucket_of(instrument_id, vanilla_instrument_count)
   local count = vanilla_count(vanilla_instrument_count)
 
-  -- Custom: anything at or above the file's vanilla count.  A non-numeric id
-  -- can never name a schedulable call, so it is custom as well.
+  -- 自定义：大于等于文件的 vanilla 计数。非数值 id 永远无法对应一次可调度的调用，
+  -- 所以也算自定义。
   if type(instrument_id) ~= "number" or instrument_id >= count then
     return "custom"
   end
 
-  -- Below the boundary: the 16 legacy note-block ids are playNote vanilla.
+  -- 边界以下：16 个旧音符盒 id 是 vanilla 的 playNote。
   if instrument_id >= 0 and instrument_id < PLAY_NOTE_COUNT then
     return "vanilla"
   end
 
-  -- ids 16..19 below the boundary are the v6 trumpets (playSound-only).
+  -- 边界以下的 id 16..19 是 v6 小号（playSound 专属）。
   if instrument_id >= PLAY_NOTE_COUNT and instrument_id <= PLAY_SOUND_MAX_ID then
     return "play_sound"
   end
 
-  -- A below-boundary id with no known call (only reachable for a malformed
-  -- count above 20).  analyze has always treated such ids as neither bucket;
-  -- "custom" keeps the classification honest -- they can never be scheduled.
+  -- 边界以下、但没有已知调用的 id（只有在计数畸形且大于 20 时才可达）。analyze 历来
+  -- 把这种 id 排除在两个桶之外；"custom" 让分类保持诚实——它们永远无法被调度。
   return "custom"
 end
 
--- resolve(instrument_id, vanilla_instrument_count) -> a call descriptor.
--- Classification is delegated to bucket_of; this function only maps the bucket
--- to the exact call shape.
+-- resolve(instrument_id, vanilla_instrument_count) -> 一个调用描述符。
+-- 分类委托给 bucket_of；本函数只把桶映射成精确的调用形状。
 function instrument_table.resolve(instrument_id, vanilla_instrument_count)
   local bucket = instrument_table.bucket_of(instrument_id,
     vanilla_instrument_count)
 
   if bucket == "custom" then
-    -- A later layer refuses these at playback and only needs custom_index for
-    -- diagnostics.  A non-numeric id has no index to report.
+    -- 后面的层在播放时会拒绝这些，只需要 custom_index 做诊断。非数值 id 没有可报的
+    -- 下标。
     local custom_index = nil
     if type(instrument_id) == "number" then
       custom_index = instrument_id - vanilla_count(vanilla_instrument_count)

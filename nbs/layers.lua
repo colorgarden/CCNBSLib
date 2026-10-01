@@ -1,84 +1,73 @@
 -- nbs/layers.lua
 --
--- NBS layers-section parser.
+-- NBS layers 分节解析器。
 --
--- The layers section is the only part of an .nbs file whose layout changes
--- with the song version, so this module is a thin, version-gated walk over the
--- shared byte cursor (nbs/reader.lua).  It performs NO decoding of its own:
--- every field is read through the cursor, and every overrun surfaces as the
--- cursor's typed E_TRUNCATED table.
+-- layers 是 .nbs 文件里**唯一**布局随歌曲版本变化的部分，所以本模块只是在共享字节
+-- 游标（nbs/reader.lua）上做一次按版本分支的薄遍历。它**自己不做任何解码**：每个
+-- 字段都经游标读取，任何越界都以游标的带类型 E_TRUNCATED 表浮出。
 --
--- FROZEN PUBLIC INTERFACE
+-- 冻结的公共接口
 --   local layers = require("nbs.layers")
---   layers.parse(r, version, layer_count) -> <array of layer records>
+--   layers.parse(r, version, layer_count) -> <图层记录数组>
 --
---   r           a cursor from nbs.reader.new(bytes)
---   version     the song version, already read by the header parser
---   layer_count the number of layer records that follow, UNTRUSTED
+--   r           来自 nbs.reader.new(bytes) 的游标
+--   version     歌曲版本，已由 header 解析器读出
+--   layer_count 后面跟的图层记录数，**不可信**
 --
--- Each returned record has EXACTLY these keys:
---   name     string, BYTE-EXACT (CP1252 bytes, never transcoded here)
---   lock     0 = unlocked, 1 = locked, 2 = SOLO ; nil when version < 4
---   volume   integer 0..100
---   panning  integer 0..200 (100 = centre) ; nil when version < 2
+-- 每条返回记录的键**精确**如下：
+--   name     字符串，**逐字节精确**（CP1252 字节，此处从不转码）
+--   lock     0 = 未锁，1 = 静音，2 = SOLO；version < 4 时为 nil
+--   volume   整数 0..100
+--   panning  整数 0..200（100 = 居中）；version < 2 时为 nil
 --
--- RECORD LAYOUT (read layer_count times, in order)
---   str name                          -- i32 length + raw bytes
---   u8  lock     -- ONLY when version >= 4
+-- 记录布局（按顺序读 layer_count 次）
+--   str name                          -- i32 长度 + 原始字节
+--   u8  lock     -- 仅当 version >= 4
 --   u8  volume   -- 0..100
---   u8  panning  -- ONLY when version >= 2  (0..200, 100 = centre)
+--   u8  panning  -- 仅当 version >= 2  （0..200，100 = 居中）
 --
--- Version matrix:
+-- 版本矩阵：
 --   v0, v1        name + volume
 --   v2, v3        name + volume + panning
---   v4 and above  name + lock + volume + panning
+--   v4 及以上     name + lock + volume + panning
 --
--- The lock byte and the panning byte are ABSENT on older versions.  Reading
--- them unconditionally would consume the next field (or the next record) and
--- silently desynchronise the entire section, so both gates are explicit below.
+-- lock 字节与 panning 字节在旧版本上是**不存在**的。无条件读它们会吃掉下一个字段
+-- （或下一条记录），把整个分节**静默地**读错位，所以下面两个分支都写得很明确。
 --
--- LOCK SEMANTICS -- three values, not two
---   The public documentation mentions only 0 (unlocked) and 1 (locked), but
---   the real format also uses 2 = SOLO.  This parser exposes the raw integer
---   verbatim; it neither rejects 2 nor folds it into 0 or 1.  Acting on solo
---   is a playback concern and lives in a later layer.
+-- LOCK 语义 —— 三个值，不是两个
+--   公开文档只提到 0（未锁）和 1（锁住），但真实格式还会用 2 = SOLO。本解析器把原始
+--   整数**原样**暴露出来；既不拒绝 2，也不把它并入 0 或 1。怎么处理 solo 是**播放**
+--   层面的关注点，归后面的层管。
 --
--- SAFETY
---   layer_count comes from the file and is untrusted (the format docs warn
---   that more than 200 layers can crash some NBS versions).  Every record
---   consumes at least 5 bytes -- a 4-byte string length plus at least one
---   volume byte -- so a count larger than the remaining byte budget cannot be
---   honest.  The guard below rejects such a count BEFORE any table is sized or
---   any record is read; it raises a typed table:
+-- 安全性
+--   layer_count 来自文件、不可信（格式文档警告超过 200 层会让某些 NBS 版本崩溃）。
+--   每条记录至少消耗 5 字节——4 字节字符串长度加至少 1 字节 volume——所以大于剩余
+--   字节预算的计数不可能是诚实的。下面的守卫在**任何表被分配、任何记录被读取之前**
+--   就拒绝这种计数；它抛出带类型的表：
 --     { code = "E_BAD_LAYER_COUNT", msg = <string>,
 --       layer_count = <n>, remaining = <n> }
---   via error(table, 0), mirroring the reader's typed-error contract so the
---   boundary layer can branch on `.code`.  A hostile count can therefore never
---   drive a large allocation or a long loop.
+--   用 error(table, 0) 抛出，对齐读取器的带类型错误契约，好让边界层按 `.code` 分支。
+--   于是恶意计数**永远**无法驱动一次大分配或长时间循环。
 --
--- Cobalt / Lua 5.2 constraints: no `//`, no bitwise operators, no goto, no
--- utf8.*, no math.maxinteger, no collectgarbage.  Only arithmetic, string and
--- table operations are used.
+-- Cobalt / Lua 5.2 约束：不用 `//`、不用位运算、不用 goto、不用 utf8.*、不用
+-- math.maxinteger、不用 collectgarbage。只使用算术、string 与 table 操作。
 
 local layers = {}
 
--- Smallest possible on-disk size of one layer record: a 4-byte string length
--- (the name may be empty, but the length prefix is always present) plus a
--- 1-byte volume.  Documented here for readers; the guard uses the simpler and
--- strictly-weaker bound `layer_count <= remaining`, which is sufficient to make
--- the loop and its allocations bounded by the input size.
+-- 单条图层记录可能的最小磁盘尺寸：4 字节字符串长度（名字可以为空，但长度前缀永远
+-- 存在）加 1 字节 volume。写在这里供读者参考；守卫用的是更简单、也**严格更弱**的
+-- 界限 `layer_count <= remaining`，它足以让循环及其分配受输入规模约束。
 local MIN_RECORD_BYTES = 5
 
--- layers.parse(r, version, layer_count) -> array of layer records.
+-- layers.parse(r, version, layer_count) -> 图层记录数组。
 --
--- Raises a typed error table on:
---   * an implausible layer_count  -> { code = "E_BAD_LAYER_COUNT", ... }
---   * a truncated name/scalar     -> { code = "E_TRUNCATED", ... } (from reader)
+-- 在下列情况下抛出带类型的错误表：
+--   * layer_count 不合理  -> { code = "E_BAD_LAYER_COUNT", ... }
+--   * 名字/标量被截断     -> { code = "E_TRUNCATED", ... }（来自 reader）
 function layers.parse(r, version, layer_count)
-  -- Untrusted-count guard.  Must run BEFORE the loop and before any array is
-  -- sized by `layer_count`: if the caller promises more records than there are
-  -- bytes left to describe them (each record needs at least MIN_RECORD_BYTES,
-  -- in particular at least one byte), the count is impossible.
+  -- 不可信计数守卫。必须在循环之前、以及在任何数组按 `layer_count` 分配之前运行：
+  -- 如果调用方承诺的记录数多于描述它们所需的剩余字节（每条记录至少要
+  -- MIN_RECORD_BYTES，尤其至少要 1 个字节），这个计数就是不可能的。
   local remaining = r:remaining()
   if layer_count > remaining then
     error({
@@ -121,40 +110,38 @@ function layers.parse(r, version, layer_count)
 end
 
 -- ---------------------------------------------------------------------------
--- WHAT THE LOCK BYTE MEANS (it is a mute/solo switch, not an editor permission)
+-- lock 字节到底是什么意思（它是**静音/solo 开关**，不是编辑权限）
 -- ---------------------------------------------------------------------------
--- The NBS specification calls this byte "Layer lock" and documents only "1 =
--- locked", which reads like an editor convenience. The OpenNBS project's own issue
--- tracker corrects that (OpenNBS/NoteBlockStudio#307):
+-- NBS 规范把这个字节叫作 "Layer lock"，只写了「1 = locked」，读起来像是编辑器里的
+-- 便捷功能。OpenNBS 项目自己的 issue 更正了这一点
+-- （OpenNBS/NoteBlockStudio#307）：
 --
 --   "The 'Layer lock' field, originally intended to be a boolean, may actually
 --    assume values 0-2 (0= unlocked, 1=locked, 2=solo). This is currently
 --    undocumented in the NBS specification..."
 --
--- and a developer in the same thread says the field is what people use to "mute
--- incomplete sections of the song or single out certain layers".
+-- 同一条帖子里的开发者说，这个字段就是人们用来「把没写完的段落静音、或把某些图层
+-- 单独挑出来听」的东西。
 --
--- The decisive argument is SOLO: a value of 2 is a PLAYBACK concept, and solo
--- cannot exist without a corresponding mute. So 1 mutes, and a player that ignores
--- it plays audio the author deliberately silenced. Measured on a real song
--- (THE KING.nbs, 65 layers): 3 layers carried lock=1 with 903 notes, all of which
--- were being played.
+-- 决定性的论据是 **SOLO**：值为 2 是一个**播放**概念，而 solo 不可能没有对应的
+-- mute。所以 1 是静音，忽略它的播放器会把作者**故意静掉**的声音播出来。在一首真实
+-- 歌曲上实测（THE KING.nbs，65 层）：3 个图层带着 lock=1、共 903 个音符，**全部**都
+-- 被播了出来。
 --
--- The rule lives HERE, next to the code that reads the byte, because TWO modules
--- need it and they must agree: player/plan.lua decides which notes become events,
--- and nbs/analyze.lua predicts how many speakers those events need. If the two
--- disagreed, the analysis would size the fan-out for notes that will never play.
+-- 规则就住在这里、紧挨着读这个字节的代码，是因为有**两个模块**需要它，且它们必须
+-- 一致：player/plan.lua 决定哪些音符变成事件，nbs/analyze.lua 预测那些事件需要几个
+-- 扬声器。两者一旦不一致，分析就会为一个永远不会播的音符规划扇出。
 
--- The three values the byte can take.
+-- 这个字节可以取的三个值。
 layers.UNLOCKED = 0
 layers.MUTED = 1
 layers.SOLO = 2
 
 -- layers.any_solo(layer_array) -> boolean
 --
--- True when ANY layer in the song is solo.  A solo on one layer silences every
--- non-solo layer, so this is a property of the SONG, not of a layer, and it has to
--- be known before any single note can be judged.
+-- 当歌曲里**任何**图层是 solo 时为真。某个图层上的 solo 会让所有非 solo 图层静音，
+-- 所以这是**歌曲**的属性、不是某个图层的属性，而且必须在判断任何单个音符之前就
+-- 知道。
 function layers.any_solo(layer_array)
   if type(layer_array) ~= "table" then
     return false
@@ -170,20 +157,20 @@ end
 
 -- layers.audible(lock, any_solo) -> boolean
 --
--- Whether a layer carrying this lock byte contributes notes.
+-- 带着这个 lock 字节的图层是否贡献音符。
 --
---   lock is nil   a v0-v3 file has no lock byte at all, so nil MUST read as
---                 unmuted; treating it as truthy would silence every old song
---   lock = 0      unlocked: plays unless some other layer is solo
---   lock = 1      MUTED: never plays
---   lock = 2      SOLO: plays, and silences every layer that is not solo
+--   lock 为 nil   v0-v3 文件根本没有 lock 字节，所以 nil **必须**读作「未静音」；
+--                 把它当作真值会把所有老歌都静音
+--   lock = 0      未锁：会播，除非别的图层是 solo
+--   lock = 1      **静音**：永不播
+--   lock = 2      **SOLO**：会播，并让所有非 solo 图层静音
 --
--- Written as a function rather than an inline expression because the rule has four
--- cases and an inline version is exactly where the next reader would go wrong.
+-- 写成函数而不是行内表达式，是因为这条规则有四种情况，而行内版本恰恰是下一个读代码
+-- 的人最容易搞错的地方。
 function layers.audible(lock, any_solo)
   if any_solo then
-    -- Solo silences everything that is not itself solo -- including ordinary
-    -- unlocked layers and, for the same reason, muted ones.
+    -- solo 会让一切**不是** solo 的东西静音——包括普通的未锁图层，也因此包括已静音
+    -- 的图层。
     return lock == layers.SOLO
   end
   return lock ~= layers.MUTED
@@ -191,11 +178,10 @@ end
 
 -- layers.audible_at(layer_array, any_solo, layer_index) -> boolean
 --
--- The same decision for a 0-based layer_index from a note record.  layer_array is
--- 1-based, so layer L is layer_array[L + 1].  A reference to a layer that the
--- decoded song does not contain has no lock byte, so it is judged as UNLOCKED --
--- which keeps the pre-existing "a missing layer still emits" contract, and, under
--- solo, correctly leaves it silent because it is not itself solo.
+-- 对音符记录里那个 **0 起算**的 layer_index 做同样的判定。layer_array 是 1 起算的，
+-- 所以图层 L 是 layer_array[L + 1]。引用的图层如果解码后的歌曲里不存在，它就没有
+-- lock 字节，于是按**未锁**判定——这保持了既有的「缺失图层照样发声」契约，并且在
+-- solo 下会正确地让它保持静音，因为它自己不是 solo。
 function layers.audible_at(layer_array, any_solo, layer_index)
   if type(layer_index) ~= "number" then
     return true

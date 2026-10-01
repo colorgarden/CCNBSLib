@@ -1,90 +1,82 @@
 -- player/runtime.lua
 --
--- THE TERMINATE-PROTECTION SEAM.
+-- 终止保护接缝。
 --
--- WHY THIS EXISTS
+-- 为什么存在
 -- ---------------
--- In CC:Tweaked, `os.pullEvent` AUTO-TERMINATES the running program when the
--- user presses Ctrl+T: it raises a "Terminated" error at the pull site and
--- every subsequent cleanup step is skipped.  For a music player that is a real
--- bug, not a nicety: the speakers keep whatever audio was queued and the
--- transport is left in an undefined state.  `os.pullEventRaw` is the escape
--- hatch -- it RETURNS the `terminate` event to the caller instead of aborting,
--- so the program gets to stop its speakers before it unwinds.  This module owns
--- that discipline in ONE place, so the player core never has to remember it.
+-- 在 CC:Tweaked 里，用户按下 Ctrl+T 时 `os.pullEvent` 会**自动终止**正在运行的程序：
+-- 它在 pull 的位置抛出一个 "Terminated" 错误，此后的每一步清理都被跳过。对一个音乐
+-- 播放器来说这是一个**真的 bug**，不是锦上添花：扬声器会保留任何已排队的音频，传输
+-- 状态被留在未定义的状态。`os.pullEventRaw` 是逃生舱——它把 `terminate` 事件**返回**
+-- 给调用方而不是中止，于是程序得以在展开之前停掉它的扬声器。本模块把这套纪律收在
+-- **一处**，播放核心永远不必自己记着它。
 --
--- FROZEN PUBLIC INTERFACE (ccnbslib.lua builds on these EXACT
--- names):
+-- 冻结的公共接口（ccnbslib.lua 建立在这些**确切**的名字上）：
 --
 --   local runtime = require("player.runtime")
 --
 --   runtime.run(body, opts) -> { terminated = <boolean>,
---                                result     = <body's return value>,
+--                                result     = <body 的返回值>,
 --                                error      = <string|nil> }
 --
---   runtime.cleanup(speakers, session) -> <integer>  -- speakers stopped
---   runtime.stop_speakers(speakers)    -> <integer>  -- speakers stopped
+--   runtime.cleanup(speakers, session) -> <integer>  -- 已停止的扬声器数
+--   runtime.stop_speakers(speakers)    -> <integer>  -- 已停止的扬声器数
 --
--- THE BODY CONTRACT
+-- BODY 契约
 -- -----------------
--- `runtime.run` calls `body(pull)`, where `pull` is the resolved event source.
--- A body that needs to wait for an event calls the pull it was handed; a body
--- that never waits can simply ignore the argument.  Resolution is LAZY and
--- happens at call time, never at module load:
+-- `runtime.run` 调用 `body(pull)`，其中 `pull` 是解析出的事件源。需要等待事件的 body
+-- 调用交给它的 pull；从不等候的 body 直接忽略这个参数即可。解析是**惰性**的，发生在
+-- 调用时，从不在模块加载时：
 --
---   * `opts.pull`, when supplied, is used verbatim (the unit-test seam); the
---     global is then NEVER consulted -- see the injection test.
---   * otherwise the global `os.pullEventRaw` is read inside `run`.
+--   * 提供 `opts.pull` 时，它被原样使用（单元测试接缝）；此时全局函数**绝不**被查询
+--     ——见注入测试。
+--   * 否则在 `run` 内部读取全局 `os.pullEventRaw`。
 --
--- If a call through that seam yields `"terminate"` as its first value, the seam
--- wrapper records the terminate and raises a terminate-shaped error so the body
--- unwinds; `run` then runs the SAME cleanup as an in-body terminate.
+-- 如果经由该接缝的一次调用把 `"terminate"` 作为它的第一个值产出，接缝包装器就记录
+-- 这次终止，并抛出一个 terminate 形状的错误，好让 body 展开；`run` 随后执行与 body
+-- 内部终止**相同的**清理。
 --
--- THE TERMINATE-SHAPE DETECTION RULE
+-- TERMINATE 形状的识别规则
 -- ----------------------------------
--- A real Ctrl+T during body execution is reported by `os.pullEvent` as a raised
--- error.  CC:T raises the string `"Terminated"` (and may prefix/suffix it), so
--- we classify ANY raised error whose message CONTAINS `"terminate"`
--- (case-insensitive) as a terminate.  Every other raised error is a genuine
--- crash:
+-- body 执行期间发生的真实 Ctrl+T 由 `os.pullEvent` 以抛出的错误报告。CC:T 抛出字符串
+-- `"Terminated"`（并且可能加前缀/后缀），所以我们把任何消息**包含** `"terminate"`
+-- （大小写不敏感）的抛出错误判定为终止。其他任何抛出错误都是真正的崩溃：
 --
---   * terminate -> terminated = true,  error = nil,      cleanup runs;
---   * other     -> terminated = false, error = <message>, cleanup STILL runs
---                 (never leak speakers on a crash) but is NOT reported as a
---                 terminate.
+--   * terminate -> terminated = true,  error = nil,      cleanup 运行；
+--   * 其他      -> terminated = false, error = <message>, cleanup **仍然**运行
+--                 （崩溃时绝不泄漏扬声器），但**不**被报告为终止。
 --
--- A normal return means terminated = false, result = body's return value, and
--- NO cleanup (there is nothing to interrupt).
+-- 正常返回意味着 terminated = false、result = body 的返回值，且**不**做清理
+-- （没有任何东西需要打断）。
 --
--- THE NEVER-RE-RAISE GUARANTEE
+-- 绝不重新抛出的保证
 -- ----------------------------
--- `runtime.run` NEVER re-raises.  A caller cannot have the program die
--- mid-cleanup: every failure -- the body, a speaker's stop(), the session's
--- cancel(), even `on_terminate` -- is contained and reported through the return
--- value.  Cleanup therefore also cannot be interrupted by a second terminate.
+-- `runtime.run` **绝不**重新抛出。调用方不可能让程序死在清理中途：每一处失败——body、
+-- 某个扬声器的 stop()、会话的 cancel()、甚至 `on_terminate`——都被收容，并通过返回值
+-- 报告。因此清理也不可能被第二次终止打断。
 --
--- `opts.speakers`: array of speaker records (player/speaker.lua), may be nil or
--- empty.  `opts.session`: optional object with a `:cancel()` method.
--- `opts.on_terminate`: optional function() run AFTER cleanup, only on terminate.
--- `opts.stop_all`: optional function(speakers) overriding the per-speaker stop.
+-- `opts.speakers`：扬声器记录数组（player/speaker.lua），可以是 nil 或空。
+-- `opts.session`：可选对象，带 `:cancel()` 方法。
+-- `opts.on_terminate`：可选 function()，在清理**之后**运行，仅在终止时。
+-- `opts.stop_all`：可选 function(speakers)，覆盖逐个扬声器的 stop。
 --
--- Compatibility: Lua 5.2 / CC:Tweaked Cobalt.  No integer division, no bitwise
--- operators, no utf8, no string.dump, no os.exit.  `os.pullEvent` is NEVER used
--- here -- `os.pullEventRaw` (or the injected seam) is the only event source.
+-- 兼容性：Lua 5.2 / CC:Tweaked 的 Cobalt。不用整除、不用位运算、不用 utf8、不用
+-- string.dump、不用 os.exit。这里**绝不**使用 `os.pullEvent`——`os.pullEventRaw`
+-- （或注入的接缝）是唯一的事件源。
 
 local runtime = {}
 
--- Unpacking helper: `table.unpack` is the Lua 5.2 name; fall back to the global
--- for older Cobalt builds.  Read at load, which is safe (it is not a host API).
+-- 解包辅助：`table.unpack` 是 Lua 5.2 的名字；对更老的 Cobalt 构建回退到全局函数。
+-- 在加载时读取，这是安全的（它不是宿主 API）。
 local unpack_values = table.unpack or unpack
 
 -- ---------------------------------------------------------------------------
--- Terminate-shape detection
+-- terminate 形状识别
 -- ---------------------------------------------------------------------------
 
--- True when a raised error's message names a terminate.  CC:Tweaked raises the
--- string "Terminated" and may add a prefix or suffix ("Terminated: press
--- Ctrl+T"), so a case-insensitive substring test is the right granularity.
+-- 当抛出的错误消息指名了一次终止时为 true。CC:Tweaked 抛出字符串 "Terminated"，并可能
+-- 加一个前缀或后缀（"Terminated: press Ctrl+T"），所以大小写不敏感的子串测试是合适的
+-- 粒度。
 local function is_terminate(value)
   if type(value) ~= "string" then
     return false
@@ -96,10 +88,9 @@ end
 -- runtime.stop_speakers(speakers) -> integer
 -- ---------------------------------------------------------------------------
 
--- Stop every speaker record, DEFENSIVELY: a speaker whose stop() raises must
--- not prevent the OTHERS from being stopped, and nothing may propagate.  Returns
--- the number of speakers that stopped successfully.  Missing/nil/non-callable
--- records are simply not counted (their pcall fails), never fatal.
+-- **防御性地**停止每一条扬声器记录：某个扬声器的 stop() 抛错，不能阻止**其他**扬声器
+-- 被停止，并且任何东西都不得向外传播。返回成功停止的扬声器数。缺失/nil/不可调用的
+-- 记录只是不被计数（它们的 pcall 失败），绝不致命。
 function runtime.stop_speakers(speakers)
   if type(speakers) ~= "table" then
     return 0
@@ -121,11 +112,10 @@ end
 -- runtime.cleanup(speakers, session) -> integer
 -- ---------------------------------------------------------------------------
 
--- Stop speakers then cancel the session, each step independently protected.
--- With `session == nil` this must not raise.  `stop_fn` is an optional override
--- for the stopping step (runtime.run threads `opts.stop_all` through here).
--- Idempotent: calling it again is harmless even if a speaker's stop() is
--- re-invoked.  Returns the number of speakers stopped successfully.
+-- 先停扬声器，再取消会话，每一步都独立受保护。当 `session == nil` 时这里不得抛错。
+-- `stop_fn` 是停止步骤的可选覆盖（runtime.run 把 `opts.stop_all` 从这里穿过去）。
+-- 幂等：即使某个扬声器的 stop() 被再次调用，再调用一次也是无害的。返回成功停止的
+-- 扬声器数。
 function runtime.cleanup(speakers, session, stop_fn)
   local stopper = runtime.stop_speakers
   if type(stop_fn) == "function" then
@@ -161,8 +151,8 @@ function runtime.run(body, opts)
   local session = opts.session
   local on_terminate = opts.on_terminate
 
-  -- Resolve the event source LAZILY, at call time only.  Reading the global at
-  -- module load would make this file un-requireable in plain Lua 5.2.
+  -- **惰性**解析事件源，只在调用时。在模块加载时读取全局会让本文件在纯 Lua 5.2 里
+  -- 无法被 require。
   local source = opts.pull
   if source == nil then
     local os_lib = rawget(_G, "os")
@@ -171,13 +161,13 @@ function runtime.run(body, opts)
     end
   end
 
-  -- Set when the seam observes a terminate; read after the body unwinds so a
-  -- body that swallowed the internal error is still treated as terminated.
+  -- 当接缝观察到一次终止时置位；在 body 展开之后读取，好让一个吞掉了内部错误的 body
+  -- 仍然被当作已终止处理。
   local seam_terminated = false
 
-  -- The pull handed to the body.  A thin, terminate-aware wrapper over the
-  -- resolved source: normally it forwards every event value unchanged, but a
-  -- first value of "terminate" becomes an unwind so cleanup cannot be skipped.
+  -- 交给 body 的 pull。一个架在已解析事件源之上的、感知 terminate 的薄包装：通常它
+  -- 原样转发每一个事件值，但第一个值为 "terminate" 时会变成一次展开，好让清理无法被
+  -- 跳过。
   local function pull(...)
     if type(source) ~= "function" then
       error("runtime.run: no event source available "
@@ -204,13 +194,12 @@ function runtime.run(body, opts)
     end
   end
 
-  -- Cleanup runs on ANY abnormal exit: terminate OR crash.  A normal return
-  -- needs no cleanup.
+  -- 清理在**任何**非正常退出时运行：终止**或**崩溃。正常返回不需要清理。
   if terminated or err ~= nil then
     runtime.cleanup(speakers, session, opts.stop_all)
   end
 
-  -- on_terminate runs AFTER cleanup, only on terminate, and cannot re-raise.
+  -- on_terminate 在清理**之后**运行，仅在终止时，且不能重新抛出。
   if terminated and type(on_terminate) == "function" then
     pcall(on_terminate)
   end

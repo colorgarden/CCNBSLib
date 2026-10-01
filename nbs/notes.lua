@@ -1,20 +1,19 @@
 -- nbs/notes.lua
 --
--- Note-section parser for Note Block Studio (.nbs) files.
+-- Note Block Studio (.nbs) 的音符分节解析器。
 --
--- The note section uses a run-length "jump" encoding: instead of storing every
--- (tick, layer) pair, it stores the DELTA to the next used tick and, within a
--- tick, the DELTA to the next used layer.  A zero delta terminates the current
--- level:
+-- 音符分节用的是游程（run-length）「跳跃」编码：它不存储每个 (tick, layer) 对，
+-- 而是存**到下一个被使用 tick 的差值**，以及同一 tick 内**到下一个被使用 layer 的
+-- 差值**。差值为 0 表示当前层级结束：
 --
 --   tick = -1
---   loop forever:
---     jumps_to_next_tick = i16            -- 0 ends the note section
+--   循环：
+--     jumps_to_next_tick = i16            -- 0 结束音符分节
 --     if jumps_to_next_tick == 0 then break
 --     tick = tick + jumps_to_next_tick
 --     layer = -1
---     loop forever:
---       jumps_to_next_layer = i16         -- 0 moves on to the next tick
+--     循环：
+--       jumps_to_next_layer = i16         -- 0 进入下一个 tick
 --       if jumps_to_next_layer == 0 then break
 --       layer = layer + jumps_to_next_layer
 --       instrument = u8
@@ -26,60 +25,52 @@
 --       else
 --         velocity = 100 ; panning = 100 ; pitch = 0
 --       end
---       emit { tick, layer, instrument, key, velocity, panning, pitch }
+--       产出 { tick, layer, instrument, key, velocity, panning, pitch }
 --
--- Notes are appended in encounter order (ascending tick, then ascending layer
--- within a tick); the parser NEVER sorts.
+-- 音符按**出现顺序**追加（tick 升序，同一 tick 内 layer 升序）；解析器**从不排序**。
 --
--- SIGNEDNESS -- the published NBS specification is internally inconsistent, so
--- this module follows the interpretation already frozen for the rest of the
--- decoder:
---   * jumps (i16) and pitch (i16) are SIGNED.
---   * instrument, key, velocity and panning are read as UNSIGNED bytes (u8).
---     Panning legitimately reaches 200, which would read as -56 if signed.
+-- 符号性 —— 公开的 NBS 规范自相矛盾，所以本模块沿用解码器其余部分已经冻结的解释：
+--   * 跳跃量（i16）与 pitch（i16）是**有符号**的。
+--   * instrument、key、velocity、panning 按**无符号**字节（u8）读。
+--     panning 合法可达 200，若按有符号读会变成 -56。
 --
--- SAFETY -- a player owns the computer's only thread, so the parser must never
--- spin or walk backwards on hostile input:
---   * A negative jump is corrupt and raises E_BAD_JUMP immediately.
---   * The cursor only ever advances (every read consumes bytes).
---   * The outer loop is capped at r:remaining() iterations (each tick consumes
---     at least its 2-byte jump), and a tick above 32000 raises
---     E_TOO_MANY_TICKS -- some NBS versions crash past that point.
---   * An absolute layer index above 200 raises E_LAYER_OVERFLOW.
---   * Overruns propagate the reader's typed E_TRUNCATED error unchanged.
+-- 安全性 —— 播放器独占电脑唯一的线程，所以解析器绝不能在恶意输入上自旋或倒退：
+--   * 负的跳跃量是损坏数据，立即抛 E_BAD_JUMP。
+--   * 游标只会前进（每次读取都消耗字节）。
+--   * 外层循环以 r:remaining() 为上限（每个 tick 至少消耗它那 2 字节跳跃量）；
+--     tick 超过 32000 抛 E_TOO_MANY_TICKS —— 某些 NBS 版本过了这个点会崩溃。
+--   * 绝对图层序号超过 200 抛 E_LAYER_OVERFLOW。
+--   * 越界会原样向上传递读取器的带类型 E_TRUNCATED 错误。
 --
--- All typed errors are TABLES raised via error(tbl, 0) so callers branch on
--- `.code`:
+-- 所有带类型的错误都是用 error(tbl, 0) 抛出的**表**，调用方按 `.code` 分支：
 --   { code = "E_BAD_JUMP" | "E_LAYER_OVERFLOW" | "E_TOO_MANY_TICKS", msg, offset }
 --
--- Lua 5.2 / Cobalt constraints: no `//`, no bitwise operators, no goto.
+-- Lua 5.2 / Cobalt 约束：不用 `//`、不用位运算、不用 goto。
 
 local notes = {}
 
--- Documented NBS unsafe-in-practice ceilings (see module header).
+-- 有记录的「实践中不安全」的 NBS 上限（见文件头）。
 local MAX_LAYER = 200
 local MAX_TICK = 32000
 
--- Typed error helper.  `offset` is the cursor position at which the offending
--- value BEGAN (i.e. r:pos() before its read).
+-- 带类型错误的辅助函数。`offset` 是有问题那个值**开始**的位置（即它被读之前
+-- 的 r:pos()）。
 local function raise(code, message, offset)
   error({ code = code, msg = message, offset = offset }, 0)
 end
 
 -- notes.parse(r, version) -> { notes = { <note>, ... }, song_length_from_notes = <int> }
 --
--- `r` is an nbs.reader cursor positioned at the first tick jump.  `song_length_from_notes`
--- is the highest tick that carries a note, plus one (0 when there are no notes);
--- v1/v2 songs, which store no length, recover it this way.
+-- `r` 是停在第一个 tick 跳跃量处的 nbs.reader 游标。`song_length_from_notes` 是
+-- 带音符的**最高 tick 加一**（没有音符时为 0）；v1/v2 不存长度，就是这样恢复出来的。
 function notes.parse(r, version)
   if type(version) ~= "number" then
     version = 0
   end
   local has_v4_fields = version >= 4
 
-  -- Byte-derived iteration cap: every outer iteration consumes at least the
-  -- 2-byte tick jump, so more ticks than bytes remaining is impossible for
-  -- honest input and implies corruption.
+  -- 由字节数推导出的迭代上限：外层每轮至少消耗那 2 字节的 tick 跳跃量，所以
+  -- tick 数多于剩余字节数对诚实输入是不可能的，只可能是损坏数据。
   local max_ticks = r:remaining()
 
   local parsed = {}

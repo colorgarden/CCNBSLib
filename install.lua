@@ -1,74 +1,66 @@
 -- SPDX-License-Identifier: GPL-2.0-only
 -- Copyright (C) 2026 colorgarden
--- Part of CCNBSLib. Licensed under GPL-2.0; see LICENSE.
+-- CCNBSLib 的一部分。以 GPL-2.0 授权；条款见 LICENSE。
 --
 -- install.lua
 --
--- THE INSTALLER: apt-shaped, terminal only.
+-- **安装器**：apt 风格，仅命令行。
 --
---     install install              fetch the manifest and install every file
---     install update               refresh the manifest, install nothing
---     install upgrade              re-fetch only the files whose size changed
---     install verify               report files that no longer match the manifest
---     install remove [--purge]     delete the installed files
---     install list                 show what is installed
+--     install install              取回清单（manifest）并安装每一个文件
+--     install update               刷新清单，不安装任何文件
+--     install upgrade              只重新取回大小发生变化的文件
+--     install verify               报告与清单不再一致的文件
+--     install remove [--purge]     删除已安装的文件
+--     install list                 显示已安装的内容
 --     install mirror <sub>         list / add / remove / default / test
 --
 -- ===========================================================================
--- WHY A SINGLE FILE, AND WHY IT IS FETCHED BY HAND FIRST
+-- 为什么是单文件，以及为什么第一步要手动取回
 -- ===========================================================================
--- A fresh CC:Tweaked computer has no `wget`, no `curl` and no package manager, so
--- the ONLY way to start is a hand-typed `http.get` followed by `shell.run`. That
--- bootstrap can only fetch ONE file with any confidence, which is why this is
--- deliberately a single file rather than a module tree:
+-- 一台全新的 CC:Tweaked 电脑没有 `wget`、没有 `curl`、也没有包管理器，所以唯一的
+-- 起点是手敲一条 `http.get` 再 `shell.run`。这个引导步骤只能有把握地取回**一个**
+-- 文件，这就是它刻意做成单文件、而不是模块树的原因：
 --
 --     local r = http.get("<mirror>/raw.githubusercontent.com/colorgarden/CCNBSLib/main/install.lua")
 --     local f = fs.open("install.lua", "w")  f.write(r.readAll())  f.close()
 --     shell.run("install.lua install")
 --
 -- ===========================================================================
--- THE FILE LIST COMES FROM A COMMITTED MANIFEST, NOT FROM GITHUB
+-- 文件清单来自仓库内已提交的 manifest，而不是来自 GitHub
 -- ===========================================================================
--- api.github.com is 403 through every GitHub proxy -- measured, not assumed -- and
--- a proxy is the whole reason this installer exists. So the list of files ships WITH
--- the repository, over raw, which proxies fine.
+-- api.github.com 经任何一个 GitHub 代理都是 403——这是实测，不是假设——而代理正是
+-- 这个安装器存在的全部理由。所以文件清单随仓库一起、走 raw 分发，raw 经代理正常。
 --
 -- ===========================================================================
--- EVERY FILE COMES FROM THE main BRANCH, THROUGH THE SAME MIRROR AS THE MANIFEST
+-- 每个文件都来自 main 分支，且与清单走同一个镜像
 -- ===========================================================================
---  .../main/nbs/analyze.lua      yes
+--  .../main/nbs/analyze.lua      可以
 --
--- One reference for everything, so there is no second thing to keep in step.
+-- 一切都只有一个参照，因此没有第二处需要保持一致。
 --
--- TEARING IS DETECTED, NOT PREVENTED. If a push lands while an install is running,
--- the manifest and the files stop agreeing and the per-file byte count catches it:
--- the install fails with E_SIZE and the user retries. That was a deliberate choice
--- over pinning a commit -- pinning needs the manifest to be read from `main` anyway
--- (the commit is only known after reading it) and it makes the manifest's own
--- freshness depend on the commit it names, which is more bookkeeping than a personal
--- project needs. The important part is that the mismatch is LOUD: never a tree
--- assembled from two different versions and reported as success.
+-- 撕裂是被**检测**出来的，而不是被阻止的。如果安装进行中有一次 push 落地，清单与
+-- 文件就不再一致，逐文件字节数会把它抓住：安装以 E_SIZE 失败，用户重试即可。这是
+-- 相较「钉住某个 commit」刻意的选择——钉住本来也需要从 `main` 读清单（commit 只有
+-- 读了才知道），而且会让清单自身的新鲜度取决于它命名的那个 commit，对个人项目来说
+-- 是多余的簿记。要紧的是这种不一致足够**响亮**：绝不出现一个由两个不同版本拼出来、
+-- 却被报告为成功的目录树。
 --
--- Integrity is therefore: a per-file byte count, checked after download. No content
--- hashing: a CC:Tweaked ROM has no crypto module, so SHA-256 would be pure Lua for
--- the privilege of defending against a threat HTTPS and the byte count already
--- cover.
+-- 因此完整性就是：逐文件字节数，下载后校验。不做内容哈希：CC:Tweaked 的 ROM 没有
+-- 加密模块，SHA-256 得用纯 Lua 写，只为防一个 HTTPS 加字节数本就已覆盖的威胁。
 --
--- Compatibility: Lua 5.2 / CC:Tweaked Cobalt. No integer division, no bitwise
--- operators, no utf8.*, no collectgarbage, no string.dump, no os.exit, no goto.
--- Every CC global is read LAZILY through a seam, so this file is `require`-able in
--- plain desktop Lua and its pure parts are unit-testable.
+-- 兼容性：Lua 5.2 / CC:Tweaked 的 Cobalt。不用整除、不用位运算、不用 utf8.*、不用
+-- collectgarbage、不用 string.dump、不用 os.exit、不用 goto。每个 CC 全局都通过
+-- 接缝（seam）**惰性**读取，所以本文件在普通桌面 Lua 里可 `require`，其纯函数部分
+-- 可做单元测试。
 
 local installer = {}
 
 installer.VERSION = "1.0.0"
 
--- The repository the files come from, and where they land. INSTALL_ROOT matches the
--- layout README documents; STATE_DIR is a subdirectory so the library's own
--- namespace contains only files that belong to the library.
+-- 文件来自哪个仓库，以及它们落在哪里。INSTALL_ROOT 与 README 记录的布局一致；
+-- STATE_DIR 是一个子目录，这样库自己的命名空间里只会有属于库的文件。
 installer.REPO = "colorgarden/CCNBSLib"
--- The one reference everything is fetched from. Named once so the installation
--- layout, the manifest and the files can never drift apart.
+-- 一切内容的唯一取回参照。只命名一次，这样安装布局、清单与文件永远不会彼此漂移。
 installer.BRANCH = "main"
 installer.RAW_HOST = "https://raw.githubusercontent.com/"
 installer.INSTALL_ROOT = "/lib"
@@ -76,17 +68,17 @@ installer.STATE_DIR = installer.INSTALL_ROOT .. "/ccnbs-install"
 installer.SOURCES_PATH = installer.STATE_DIR .. "/sources.txt"
 installer.INSTALLED_PATH = installer.STATE_DIR .. "/installed.txt"
 
--- Mirrors tried in order, and rotated on failure. gh.llkk.cc and ghproxy.net are the
--- two the user named; `direct` reaches GitHub itself for a computer that can.
+-- 按顺序尝试的镜像，失败即轮换。gh.llkk.cc 与 ghproxy.net 是用户点名的两个；
+-- `direct` 面向一台网络能直连的电脑，直达 GitHub 本身。
 --
--- A prefix is a genuine PREFIX of the final URL, prepended to the complete raw URL:
+-- prefix 是最终 URL 真正的**前缀**，被拼在完整的 raw URL 之前：
 --
---   proxy:  "https://gh.llkk.cc/"  ->  https://gh.llkk.cc/https://raw.githubusercontent.com/...
---   direct: ""                     ->  https://raw.githubusercontent.com/...
+--   代理：  "https://gh.llkk.cc/"  ->  https://gh.llkk.cc/https://raw.githubusercontent.com/...
+--   直连：  ""                     ->  https://raw.githubusercontent.com/...
 --
--- So `direct`'s prefix is EMPTY, not the raw host. Writing the host there would
--- double it -- prefix + the raw URL already starts with that host -- and the empty
--- string is what makes one template cover both cases with no special-casing.
+-- 所以 `direct` 的 prefix 是**空串**，而不是 raw 主机名。在那里写主机名会把它
+-- 翻倍——prefix 加上本就以该主机名开头的 raw URL——而空串正是让同一套模板不用
+-- 任何特判就能覆盖两种情况的原因。
 installer.DEFAULT_MIRRORS = {
   { name = "gh.llkk.cc", prefix = "https://gh.llkk.cc/" },
   { name = "ghproxy.net", prefix = "https://ghproxy.net/" },
@@ -95,8 +87,8 @@ installer.DEFAULT_MIRRORS = {
 }
 
 -- ---------------------------------------------------------------------------
--- Seams -- every host API is reached through these, so a test can drive the whole
--- installer without a network, a disk or a terminal
+-- 接缝（seams）—— 每个宿主 API 都经由这些接缝访问，所以测试可以在没有网络、没有
+-- 磁盘、没有终端的情况下驱动整个安装器
 -- ---------------------------------------------------------------------------
 
 local seams = {}
@@ -122,19 +114,17 @@ local function http_seam()
   return seams.http or raw_global("http")
 end
 
--- read_seam(): how the installer asks the user a question.
+-- read_seam()：安装器如何向用户提问。
 --
--- Injected through the seam so a test can answer it; `read` is a CC global, and an
--- interactive path that was never exercised is exactly how the autorun bug survived
--- (written, never run, silently wrong). Returns nil when there is no way to read,
--- which every caller treats as "the user said nothing".
+-- 通过接缝注入，好让测试来回答；`read` 是一个 CC 全局，而一条从未被跑过的交互路径
+-- 正是 autorun 那个 bug 存活下来的方式（写了、从没运行、悄悄出错）。无法读取时
+-- 返回 nil，每个调用方都把它当作「用户什么也没说」。
 --
--- NO ARGUMENTS TO `read`. Its first parameter is a REPLACE CHARACTER for hiding a
--- password -- `read([replaceChar [, history [, completeFn [, default]]]])` -- and it
--- keeps only that string's first character. Calling it as
--- `read("number (blank to cancel): ")` therefore showed NO prompt and echoed every
--- keystroke as the letter "n". There is no prompt parameter; the prompt is WRITTEN
--- first (the same bug was in nbsplay.lua).
+-- 调用 `read` **不传参数**。它的第一个参数是用来隐藏密码的**替换字符**
+-- —— `read([replaceChar [, history [, completeFn [, default]]]])` —— 并且只取该
+-- 字符串的第一个字符。因此写成 `read("number (blank to cancel): ")` 时**提示语不会
+-- 显示**，而且每一次按键都会回显成字母 "n"。它没有提示语参数；提示语要先**写出**
+-- 去（nbsplay.lua 里也有同一个 bug）。
 local function read_seam()
   if type(seams.read) == "function" then
     return seams.read()
@@ -152,9 +142,8 @@ end
 
 -- installer.file_size(path) -> number | nil
 --
--- Uses the fs seam when there is one, and falls back to plain io so the spec can
--- size real files on a desktop. Returning nil rather than raising lets a caller say
--- "could not read" instead of crashing on a file that vanished mid-run.
+-- 有 fs 接缝时用它，否则退回到普通 io，好让 spec 能在桌面上量真实文件的大小。返回
+-- nil 而不是抛错，让调用方可以说「读不到」，而不是在一个运行中途消失的文件上崩掉。
 function installer.file_size(path)
   local fs_api = fs_seam()
   if type(fs_api) == "table" and type(fs_api.getSize) == "function" then
@@ -175,13 +164,12 @@ function installer.file_size(path)
 end
 
 -- ---------------------------------------------------------------------------
--- Output
+-- 输出
 -- ---------------------------------------------------------------------------
--- Two kinds, and conflating them wrecks the screen -- the same split nbsplay uses.
--- A permanent line is written once and the cursor moves DOWN a row; a live line is
--- redrawn in place. The row is advanced with setCursorPos, NOT term.write("\n"),
--- which does not make a newline at all: it stores "\n" as an ordinary character and
--- moves the cursor one COLUMN, so every message would overwrite the last.
+-- 两种，混为一谈就会毁掉屏幕——与 nbsplay 采用的是同一种划分。永久行写一次，光标
+-- 下移一行；实时行原地重绘。换行用 setCursorPos 推进，**不是** term.write("\n")，
+-- 后者根本不会换行：它把 "\n" 当作普通字符存下，把光标移动一**列**，于是每条消息
+-- 都会覆盖上一条。
 
 local function make_writer()
   local term = term_seam()
@@ -232,11 +220,11 @@ local function make_writer()
       term.write(tostring(text))
       advance()
     end,
-    -- A PROMPT: written where the cursor is, and the cursor is LEFT there, because the
-    -- user types on this line and `read` echoes from the current position.
+    -- prompt：写在光标当前所在处，并把光标**留在**那里，因为用户就在这一行输入，
+    -- 而 `read` 会从当前位置回显。
     --
-    -- This exists because `read` takes NO prompt argument -- its first parameter is a
-    -- replace character, for hiding a password -- so the prompt has to be written here.
+    -- 它存在是因为 `read` **不接收**提示语参数——它的第一个参数是用于隐藏密码的
+    -- 替换字符——所以提示语只能在这里写出去。
     prompt = function(text)
       if live then
         term.clearLine()
@@ -260,25 +248,23 @@ local function make_writer()
 end
 
 -- ---------------------------------------------------------------------------
--- Pure: manifest
+-- 纯函数：清单（manifest）
 -- ---------------------------------------------------------------------------
 
 -- installer.safe_path(path) -> boolean, reason
 --
--- A manifest arrives over the network, so its paths are UNTRUSTED. An installer that
--- joined them naively could write to /startup or overwrite anything the user owns.
--- Every escape form is refused rather than normalised, because normalising means
--- guessing what the author meant, and there is no author here to ask:
+-- 清单从网络到达，所以它的路径**不可信**。一个把它们天真拼接起来的安装器可能写到
+-- /startup，或覆盖用户拥有的任何东西。每一种逃逸形式都被拒绝、而不是被规范化，
+-- 因为规范化意味着猜测作者的本意，而这里没有作者可问：
 --
---   "../escape.lua"          parent traversal
---   "nbs/../../escape.lua"   traversal from inside a subdirectory
---   "/absolute.lua"          an absolute path
---   "C:/windows.lua"         a Windows drive
---   "nbs\\..\\..\\x.lua"     the backslash form of the same thing
+--   "../escape.lua"          向上级目录穿越
+--   "nbs/../../escape.lua"   从子目录内部穿越
+--   "/absolute.lua"          一个绝对路径
+--   "C:/windows.lua"         一个 Windows 盘符
+--   "nbs\\..\\..\\x.lua"     同一件事的反斜杠写法
 --
--- A path is accepted only if it is made of plain components: letters, digits, dot,
--- dash, underscore, separated by single forward slashes, with no empty component and
--- no "." or ".." component.
+-- 一个路径只有由朴素的组成部分构成时才被接受：字母、数字、点、短横、下划线，以单个
+-- 正斜杠分隔，没有空组成部分，也没有 "." 或 ".." 组成部分。
 function installer.safe_path(path)
   if type(path) ~= "string" or path == "" then
     return false, "path is empty"
@@ -314,22 +300,19 @@ end
 
 -- installer.parse_manifest(text) -> { version, files } | nil, error
 --
--- Deliberately two flat keywords, so the parser is small enough to reason about
--- completely and cannot be fooled by nesting:
+-- 刻意只用两个扁平的关键字，这样解析器小到可以完整地推理，也不会被嵌套骗到：
 --
---   # comment
+--   # 注释
 --   version 1.0.0
 --   file    <path> <bytes>
 --
--- A `commit` line is ACCEPTED AND IGNORED, not rejected: an older manifest may carry
--- one, and the state written by a previous install is read back with this same
--- parser, so refusing it would break `install list` on a computer that was installed
--- before this format changed. Ignoring it is honest -- the files come from `main`
--- either way, so a recorded commit describes nothing this program acts on.
+-- `commit` 行是**接受并忽略**，而不是拒绝：老清单可能带着一行，而上一次安装写下的
+-- 状态会用同一个解析器读回来，所以拒绝它会让 `install list` 在「格式变更之前就已
+-- 安装」的电脑上坏掉。忽略它是诚实的——无论哪种情况文件都来自 `main`，所以一条被
+-- 记录下来的 commit 描述不了任何本程序会据以行动的东西。
 --
--- Every refusal is a REFUSAL, not a warning: a manifest that says something
--- contradictory ("the same file is 10 bytes and 20 bytes") has no defensible reading,
--- and guessing would install a tree nobody chose.
+-- 每一次拒绝都是**拒绝**，不是警告：一份自相矛盾的清单（「同一个文件既是 10 字节
+-- 又是 20 字节」）没有站得住脚的解释，而猜测会安装出一棵没人选过的目录树。
 function installer.parse_manifest(text)
   if type(text) ~= "string" or text == "" then
     return nil, "the manifest is empty"
@@ -350,8 +333,8 @@ function installer.parse_manifest(text)
         end
         version = rest
       elseif keyword == "commit" then
-        -- Accepted and ignored; see the note above. Deliberately not validated, so a
-        -- recorded commit can never block a legitimate install.
+        -- 接受并忽略；见上文说明。刻意不校验，这样一条被记录下来的 commit 永远
+        -- 无法拦住一次合法安装。
         commit = rest
       elseif keyword == "file" then
         local path, size_text = rest:match("^(%S+)%s+(%S+)$")
@@ -385,19 +368,17 @@ function installer.parse_manifest(text)
     return nil, "the manifest lists no file lines"
   end
 
-  -- `commit` is carried through when present so a caller can display it if it wants
-  -- to, but nothing depends on it.
+  -- 存在 `commit` 时把它带出去，好让调用方想显示就显示，但不依赖它。
   return { version = version, commit = commit, files = files }
 end
 
 -- installer.build_url(prefix, reference, path) -> string
 --
--- One template covers a proxy AND no proxy: a proxy prefix is concatenated with the
--- real raw URL, and `direct`'s prefix is the EMPTY string, so the same expression
--- produces the right thing for both.
+-- 一套模板同时覆盖「有代理」与「无代理」：代理 prefix 与真正的 raw URL 拼接，而
+-- `direct` 的 prefix 是**空串**，所以同一个表达式对两种情况都产出正确结果。
 --
--- `reference` is whatever comes after the repository name in a raw URL -- `main`
--- here. It is a parameter rather than a constant so the value lives in one place.
+-- `reference` 是 raw URL 里仓库名之后的那一段——这里是 `main`。它做成参数而不是
+-- 常量，是为了让这个值只存在于一处。
 function installer.build_url(prefix, reference, path)
   local base = tostring(prefix or "")
   if base ~= "" and base:sub(-1) ~= "/" then
@@ -409,10 +390,9 @@ end
 
 -- installer.next_mirror(mirrors, index) -> mirror
 --
--- The mirror to try on attempt number `index`, WRAPPING past the end. A single
--- unreachable mirror must not leave the user with no source at all, and wrapping is
--- what lets the retry loop be bounded: `attempt = 1..#mirrors` visits every mirror
--- exactly once, in order, starting with the preferred one.
+-- 第 `index` 次尝试该用的镜像，越界后**回绕**。单个不可达的镜像绝不能把用户留在
+-- 「一个来源都没有」的境地，而回绕正是让重试循环有界的原因：`attempt = 1..#mirrors`
+-- 会按顺序恰好访问每个镜像一次，从首选的那个开始。
 function installer.next_mirror(mirrors, index)
   if type(mirrors) ~= "table" or #mirrors == 0 then
     return nil
@@ -422,14 +402,14 @@ function installer.next_mirror(mirrors, index)
   if position < 1 then
     position = 1
   end
-  -- ((n - 1) % count) + 1 maps any positive n onto 1..count, so the caller needs no
-  -- bounds check and attempt count == mirror count is exactly one full pass.
+  -- ((n - 1) % count) + 1 把任意正数 n 映射到 1..count，所以调用方不用做边界检查，
+  -- 且尝试次数 == 镜像数恰好是一整轮。
   position = (position - 1) % count + 1
   return mirrors[position]
 end
 
 -- ---------------------------------------------------------------------------
--- Pure: command line
+-- 纯函数：命令行
 -- ---------------------------------------------------------------------------
 
 installer.COMMANDS = {
@@ -439,8 +419,8 @@ installer.COMMANDS = {
 
 -- installer.parse_command(argv) -> { command, args, flag } | nil, error
 --
--- Flags may appear anywhere. `--mirror` takes the next word as its value, so a bare
--- trailing `--mirror` is refused rather than silently pinning a mirror named "".
+-- 旗标可以出现在任何位置。`--mirror` 取下一个词作为它的值，所以一个悬空的
+-- `--mirror` 会被拒绝，而不是悄悄钉住一个名叫 "" 的镜像。
 function installer.parse_command(argv)
   if type(argv) ~= "table" or #argv == 0 then
     return nil, "no command given"
@@ -488,13 +468,13 @@ function installer.parse_command(argv)
 end
 
 -- ---------------------------------------------------------------------------
--- Fetching
+-- 取回（Fetching）
 -- ---------------------------------------------------------------------------
 
 -- choose_mirrors(flag_mirror) -> array
 --
--- A pinned mirror is tried FIRST and the rest follow, so `--mirror x` diagnoses a
--- mirror without turning a hiccup into a failure.
+-- 被钉住的镜像**先**试，其余跟在后面，这样 `--mirror x` 既能诊断某个镜像，又不会
+-- 把一次小故障变成一次失败。
 local function choose_mirrors(flag_mirror)
   local list = installer.DEFAULT_MIRRORS
   if flag_mirror == nil then
@@ -519,11 +499,10 @@ end
 
 -- fetch(url) -> body | nil, reason
 --
--- http.get does NOT raise on a failed request -- it returns nil, message, and
--- possibly a failing response handle. pcall carries all of that through, so the
--- reason arrives in the THIRD slot; capturing only the second reports "the request
--- failed" for a 404, which tells the user nothing. The failing handle is a real
--- handle and is closed, because CC caps open files.
+-- http.get 在请求失败时**不抛错**——它返回 nil、message，可能还有一个失败的响应
+-- 句柄。pcall 把这些都带出来，所以 reason 落在**第三个**槽位；只捕获第二个会把一个
+-- 404 报成「请求失败」，对用户而言什么都没说。那个失败的句柄是一个真句柄，会被关闭，
+-- 因为 CC 对打开文件数有上限。
 local function fetch(url)
   local api = http_seam()
   if type(api) ~= "table" or type(api.get) ~= "function" then
@@ -566,15 +545,14 @@ local function fetch(url)
   return body
 end
 
--- prefer_mirror(mirrors, chosen) -> array with `chosen` first
+-- prefer_mirror(mirrors, chosen) -> 把 `chosen` 放到最前的数组
 --
--- A mirror that just served the manifest has PROVEN it works, so every later request
--- should try it before the ones already known to be slow. Without this, each of the
--- 20 files walks the whole list from the top, and with two dead mirrors ahead of the
--- good one that is two 30-second http timeouts PER FILE -- twenty minutes of silence
--- for a reason the installer already knew after the first request.
+-- 刚刚服务过清单的镜像已经**证明**了自己可用，所以之后每个请求都该先试它，而不是
+-- 那些已知很慢的。没有这一步，20 个文件每一个都会从列表顶端走一遍，而在好的镜像
+-- 前面有两个死镜像时，那就是**每个文件**两次 30 秒的 http 超时——二十分钟的沉默，
+-- 而原因安装器在第一个请求之后就已经知道了。
 --
--- The rest keep their order, so a mirror that starts failing later is still reachable.
+-- 其余镜像保持原有顺序，这样后来才开始失败的镜像仍然可达。
 function installer.prefer_mirror(mirrors, chosen)
   if type(mirrors) ~= "table" or #mirrors == 0 or type(chosen) ~= "table" then
     return mirrors
@@ -589,7 +567,7 @@ function installer.prefer_mirror(mirrors, chosen)
 end
 
 -- ---------------------------------------------------------------------------
--- Disk
+-- 磁盘
 -- ---------------------------------------------------------------------------
 
 local function read_file(path)
@@ -632,11 +610,10 @@ local function write_file(path, text)
   return true
 end
 
--- make_dir(path): create path and every missing parent.
+-- make_dir(path)：创建 path 以及每一级缺失的父目录。
 --
--- `/lib` exists on a CraftOS computer, but `/lib/nbs` and `/lib/player` do not, and
--- neither does the state directory. Each component is created in turn because fs.makeDir
--- only makes ONE level.
+-- `/lib` 在 CraftOS 电脑上存在，但 `/lib/nbs` 与 `/lib/player` 不存在，状态目录也不
+-- 存在。每个组成部分依次创建，因为 fs.makeDir 只创建**一层**。
 local function make_dir(path)
   local fs_api = fs_seam()
   if type(fs_api) ~= "table" or type(fs_api.makeDir) ~= "function" then
@@ -669,7 +646,7 @@ local function delete_file(path)
 end
 
 -- ---------------------------------------------------------------------------
--- Mirrors on disk
+-- 磁盘上的镜像
 -- ---------------------------------------------------------------------------
 
 local function parse_sources(text)
@@ -677,9 +654,9 @@ local function parse_sources(text)
   for line in (tostring(text or "") .. "\n"):gmatch("([^\n]*)\n") do
     local clean = line:gsub("\r", ""):gsub("^%s+", ""):gsub("%s+$", "")
     if clean ~= "" and clean:sub(1, 1) ~= "#" then
-      -- The prefix may be ABSENT, which is how `direct` is written: an empty prefix
-      -- means "prepend nothing", i.e. fetch the raw URL as-is. `%s*` then `%S*` so a
-      -- line that is only a name parses rather than being skipped.
+      -- prefix 可以**缺席**，`direct` 就是这么写的：空前缀表示「不前置任何东西」，
+      -- 即按原样取回 raw URL。用 `%s*` 再接 `%S*`，好让只有名字的一行能被解析出来，
+      -- 而不是被跳过。
       local name, prefix = clean:match("^(%S+)%s*(%S*)$")
       if name ~= nil then
         mirrors[#mirrors + 1] = { name = name, prefix = prefix or "" }
@@ -706,13 +683,12 @@ local function render_sources(mirrors)
   return table.concat(lines, "\n") .. "\n"
 end
 
--- copy_mirrors(mirrors) -> a shallow copy of the array
+-- copy_mirrors(mirrors) -> 该数组的一个浅拷贝
 --
--- load_mirrors must NEVER hand out installer.DEFAULT_MIRRORS itself. `mirror add`
--- appends to whatever it is given, so returning the module constant let one command
--- permanently edit the defaults for the rest of the process -- a second run in the
--- same process then saw a longer list, and repeated adds accumulated duplicates. A
--- copy per caller makes the defaults immutable in practice.
+-- load_mirrors 绝不能把 installer.DEFAULT_MIRRORS 本身交出去。`mirror add` 会向
+-- 交给它的任何东西追加，所以返回模块常量会让一条命令在进程余下的生命周期里永久
+-- 改写默认值——同一个进程里再跑一次就会看到更长的列表，反复 add 还会累积重复项。
+-- 每个调用方拿一份拷贝，就让默认值在事实上不可变。
 local function copy_mirrors(mirrors)
   local copy = {}
   for index = 1, #mirrors do
@@ -743,22 +719,19 @@ end
 
 -- select_mirror(mirrors, out, opts) -> mirror | nil, reason
 --
--- The numbered menu, shared by `install` and `mirror pick` because they differ only
--- in what a blank answer MEANS:
+-- 编号菜单，由 `install` 与 `mirror pick` 共用，因为二者只在一件事上不同：空答案
+-- **意味**着什么：
 --
---   opts.allow_automatic = true   blank means "use the automatic order" and returns
---                                 nil without complaint. This is the install path: a
---                                 user pressing enter wants the install to proceed,
---                                 not to be cancelled.
---   opts.allow_automatic = false  blank cancels, and the reason says so. This is
---                                 `mirror pick`, a command whose entire purpose is to
---                                 CHANGE the setting, so "change nothing" is a valid
---                                 outcome that has to be reported.
+--   opts.allow_automatic = true   空答案意为「按自动顺序来」，并且不作抱怨地返回
+--                                 nil。这是安装路径：用户按下回车是希望安装继续，
+--                                 而不是被取消。
+--   opts.allow_automatic = false  空答案即取消，reason 会说明这一点。这是
+--                                 `mirror pick`——它存在的全部目的就是**修改**设置，
+--                                 所以「什么都不改」是一个有效结果，必须被报告出来。
 --
--- The chosen mirror is tested before it is returned: an unreachable choice would
--- otherwise be used for every file and fail twenty times. When the test fails the
--- reason is returned and the caller decides -- for an install that means carrying on
--- with the automatic order, which skips dead mirrors anyway.
+-- 被选中的镜像在返回之前会先测一遍：一个不可达的选择否则会用于每个文件、失败二十
+-- 次。测试失败时返回 reason，由调用方决定——对安装而言这意味着继续走自动顺序，而
+-- 自动顺序本来就会跳过死镜像。
 local function select_mirror(mirrors, out, opts)
   opts = type(opts) == "table" and opts or {}
 
@@ -777,13 +750,13 @@ local function select_mirror(mirrors, out, opts)
     prompt = "number (blank to cancel): "
   end
 
-  -- WRITE THE PROMPT, THEN READ. There is no prompt argument to `read` -- its first
-  -- parameter is a replace character -- so writing it here is the only way it appears.
+  -- 先写提示语，再读。`read` 没有提示语参数——它的第一个参数是替换字符——所以在这里
+  -- 写出去是它唯一能出现的方式。
   out.prompt(prompt)
   local answer = read_seam()
 
   if type(answer) ~= "string" then
-    -- No way to read: not an error, just nothing to ask.
+    -- 无法读取：不是错误，只是没什么可问的。
     return nil, "nothing was read"
   end
 
@@ -800,7 +773,7 @@ local function select_mirror(mirrors, out, opts)
   if choice == nil or choice ~= math.floor(choice)
     or choice < 1 or choice > #mirrors then
     if opts.allow_automatic then
-      -- Do not abort an install over a typo; say so and carry on automatically.
+      -- 不要因为一次笔误就中止安装；说明情况并自动继续。
       return nil, "not a listed number, so the automatic order is used"
     end
     return nil, "not a listed number, so nothing changed"
@@ -824,7 +797,7 @@ local function select_mirror(mirrors, out, opts)
 end
 
 -- ---------------------------------------------------------------------------
--- Commands
+-- 命令
 -- ---------------------------------------------------------------------------
 
 local function human_bytes(count)
@@ -838,13 +811,13 @@ local function human_bytes(count)
   return string.format("%.1f MiB", number / (1024 * 1024))
 end
 
--- installer.progress_line(done, total, label, columns) -> a line that FITS
+-- installer.progress_line(done, total, label, columns) -> 一条**放得下**的行
 --
--- Kept strictly NARROWER than the terminal, because term.write does NOT wrap: text
--- past the right edge is CLIPPED and lost (measured; see nbsplay, which learned this
--- the hard way). The counter is the last thing to go, since it is the progress.
+-- 刻意保持严格**窄于**终端，因为 term.write **不会**折行：越过右边缘的文字会被
+-- **裁剪**并丢失（实测；见 nbsplay，它是吃了苦头才学到这一点的）。计数器是最后才
+-- 牺牲的东西，因为它就是进度本身。
 --
--- Pure, so the arithmetic is pinned by the spec rather than trusted.
+-- 纯函数，所以这套算术由 spec 钉住，而不是靠信任。
 function installer.progress_line(done, total, label, columns)
   local width = tonumber(columns)
   if width == nil then
@@ -881,7 +854,7 @@ function installer.progress_line(done, total, label, columns)
   local text = name .. " [" .. string.rep("#", filled)
     .. string.rep("-", bar_width - filled) .. "] " .. numbers
   if bar_width == 0 then
-    -- No room for a bar at all: the counter alone still says something is happening.
+    -- 连放一条进度条的地方都没有：光靠计数器也足以说明有事情在发生。
     text = name .. " " .. numbers
   end
   if #text > width - 1 then
@@ -890,12 +863,11 @@ function installer.progress_line(done, total, label, columns)
   return text
 end
 
--- A progress line kept strictly NARROWER than the terminal, because term.write does
+-- 一条严格保持**窄于**终端的进度行，因为 term.write 会
 -- download_one(path, mirrors, log) -> body | nil, reason
 --
--- Rotation happens HERE, per file: a mirror that answered the manifest may still be
--- unhealthy for a large file, and an install should not fail outright because one
--- mirror went down mid-way.
+-- 轮换就发生**这里**，逐文件：一个应答了清单的镜像对一个大文件仍可能不健康，而一次
+-- 安装不该因为某个镜像中途挂掉就整场失败。
 local function download_one(path, mirrors, log)
   local last_reason = nil
   for attempt = 1, #mirrors do
@@ -915,14 +887,13 @@ end
 
 -- manifest_from(mirrors, log, out) -> parsed | nil, reason, answered_mirror
 --
--- FEEDBACK IS NOT OPTIONAL HERE. `http.get` waits up to 30 seconds before it gives up
--- (DEFAULT_TIMEOUT in HTTPAPI.java, and the host config can raise it), so trying four
--- mirrors in silence can leave the screen frozen for two minutes. A user cannot tell
--- that from a crash, and the natural response is to hit Ctrl+T. So every attempt is
--- announced on ONE refreshed line -- which mirror, which number, and how it ended.
+-- 这里**不能没有**反馈。`http.get` 在放弃前会等最多 30 秒（HTTPAPI.java 里的
+-- DEFAULT_TIMEOUT，而且宿主配置可以调高），所以静默地试四个镜像能让屏幕冻住两分钟。
+-- 用户无法把它和「崩溃」区分开，自然的反应就是去按 Ctrl+T。所以每一次尝试都会在**同
+-- 一条刷新行**上播报——哪个镜像、第几个、以及结果如何。
 --
--- The mirror that answered is RETURNED, so the caller can try it first for every later
--- request. See installer.prefer_mirror for why that matters more than it looks.
+-- 应答过的镜像会被**返回**，好让调用方在之后每个请求里先试它。为什么这件事比看上去
+-- 更重要，见 installer.prefer_mirror。
 local function manifest_from(mirrors, log, out)
   local last_reason = nil
   local total = #mirrors
@@ -1018,13 +989,13 @@ local function installed_state()
 end
 
 -- ---------------------------------------------------------------------------
--- run(argv, opts) -> exit code
+-- run(argv, opts) -> 退出码
 -- ---------------------------------------------------------------------------
 
 function installer.run(argv, opts)
   opts = type(opts) == "table" and opts or {}
 
-  -- The read seam can be supplied per call, which is how a test answers a prompt.
+  -- read 接缝可以按次调用提供，测试就是靠它来回答一个提示的。
   if type(opts.read) == "function" then
     seams.read = opts.read
   end
@@ -1063,21 +1034,18 @@ function installer.run(argv, opts)
     out.line("options: --mirror <name>   --debug")
   end
 
-  -- NO ARGUMENTS MEANS INSTALL.
+  -- 没有参数就是 install。
   --
-  -- This is what makes the tool one command on a fresh computer. CC:Tweaked ships
-  -- `wget`, whose `run` form downloads a file and executes it, passing any remaining
-  -- words through as varargs:
+  -- 这正是让这个工具在一台全新电脑上成为一条命令的原因。CC:Tweaked 自带 `wget`，
+  -- 它的 `run` 形式会下载一个文件并执行它，把剩下的词作为变参传进去：
   --
-  --     wget run <url>              -- this file runs with no arguments
-  --     wget run <url> upgrade      -- ...with "upgrade"
+  --     wget run <url>              -- 本文件不带参数运行
+  --     wget run <url> upgrade      -- ……带上 "upgrade"
   --
-  -- so defaulting to install makes the shortest possible command the one that does the
-  -- thing a user wants. `help` prints the usage.
+  -- 所以默认走 install 让最短的那条命令恰好就是用户想要的那件事。`help` 打印用法。
   --
-  -- The empty table is built from `argv or {}` rather than passed straight through,
-  -- because parse_command REFUSES a non-table and an unattended run must not depend on
-  -- the caller having supplied one.
+  -- 空表由 `argv or {}` 构造、而不是直接透传，因为 parse_command **拒绝**非表，而一次
+  -- 无人值守的运行不该依赖调用方是否提供过它。
   local parsed_command, command_error = installer.parse_command(argv)
   if parsed_command == nil then
     if type(argv) == "table" and #argv == 0 then
@@ -1104,9 +1072,8 @@ function installer.run(argv, opts)
 
   -- ---------------------------------------------------------------- install
   if command == "install" then
-    -- ASK FIRST. The automatic order is tried only if the user declines to choose,
-    -- because a computer whose network blocks most of these hosts has no way to say
-    -- which one works -- and the alternative is twenty minutes of timeouts.
+    -- 先问。只有用户不愿选择时才走自动顺序，因为一台网络屏蔽掉这些主机的电脑没法
+    -- 说出哪一个可用——而替代方案就是二十分钟的超时。
     local chosen, why = select_mirror(mirrors, out, { allow_automatic = true })
     if chosen ~= nil then
       mirrors = installer.prefer_mirror(mirrors, chosen)
@@ -1122,7 +1089,7 @@ function installer.run(argv, opts)
       say("try: install mirror pick    (choose one interactively)")
       return 1
     end
-    -- The mirror that answered is tried first from here on.
+    -- 从这里开始，应答过的镜像被优先尝试。
     mirrors = installer.prefer_mirror(mirrors, answered)
     say(string.format("CCNBSLib %s -- %d files", parsed.version, #parsed.files))
 
@@ -1266,8 +1233,8 @@ function installer.run(argv, opts)
       end
     end
     delete_file(installer.INSTALLED_PATH)
-    -- sources.txt is the USER'S preference, not part of the package, so it survives
-    -- a plain remove -- the same reason `apt remove` leaves sources.list alone.
+    -- sources.txt 是**用户**的偏好，不属于包，所以它在一次普通 remove 后存活——
+    -- 与 `apt remove` 不动 sources.list 是同一个道理。
     if flag.purge then
       delete_file(installer.SOURCES_PATH)
       say("purged mirror settings as well")
@@ -1414,8 +1381,7 @@ function installer.run(argv, opts)
     end
 
     if sub == "pick" then
-      -- Change the saved order. A blank answer CANCELS, because this command exists
-      -- only to change the setting.
+      -- 改动已保存的顺序。空答案即取消，因为这条命令存在的唯一目的就是修改设置。
       local list = load_mirrors()
       local chosen, reason = select_mirror(list, out, { allow_automatic = false })
 
@@ -1440,41 +1406,36 @@ function installer.run(argv, opts)
 end
 
 -- ---------------------------------------------------------------------------
--- Autorun
+-- 自动运行（Autorun）
 -- ---------------------------------------------------------------------------
--- WHEN THIS RUNS, AND WHY THE GUARD LOOKS LIKE THIS.
+-- 它在**什么时候**运行，以及这个守卫为什么长这样。
 --
--- It used to ask `shell.getRunningProgram():find("install")` -- "am I being run as a
--- program?" -- and answer by NAME. That is unreliable in exactly the situations a
--- user hits first, and it fails SILENTLY, which is the worst shape a failure can
--- take. Measured, in three cases:
+-- 它原本问的是 `shell.getRunningProgram():find("install")`——「我是作为一个程序
+-- 被运行的吗？」——并**按名字**作答。这恰恰在用户最先遇到的那些场景里不可靠，而且
+-- 失败得**悄无声息**，这是失败能有的最糟糕形态。实测，三种情形：
 --
---   1. run from the shell as `install.lua install`  -> worked
---   2. run with no arguments                        -> usage, then a raised error
---   3. code run from the Lua REPL (which is how the file is downloaded in the first
---      place)                                       -> getRunningProgram() names
---                                                      rom/programs/lua.lua, the
---                                                      guard failed, and the file
---                                                      reached its final `return`
---                                                      having printed NOTHING
+--   1. 从 shell 以 `install.lua install` 运行       -> 正常
+--   2. 不带参数运行                                 -> 打印 usage，然后抛错
+--   3. 从 Lua REPL 运行代码（文件最初就是这样下载的）-> getRunningProgram() 报的是
+--                                                      rom/programs/lua.lua，守卫
+--                                                      失败，文件走到它最后的
+--                                                      `return`，却**什么都没打印**
 --
--- Case 3 is a user's report of "it just exits". The name can also change under a
--- rename, `dofile`, or a paste into the REPL, so the check cannot be repaired by
--- matching harder.
+-- 情形 3 就是用户报告的「它直接退了」。这个名字还会在重命名、`dofile` 或粘贴进
+-- REPL 时改变，所以这个检查没法靠匹配得更狠来修好。
 --
--- The guard is therefore "a shell exists and nobody disabled it". That is the same
--- shape nbsplay already uses, and it fails LOUDLY: an accidental run prints the
--- usage instead of nothing at all. A library consumer that wants the module without
--- running it sets the flag, which is what the tests do.
+-- 因此守卫是「shell 存在，且没有人禁用它」。这与 nbsplay 已经采用的形式相同，并且它
+-- 失败得**响亮**：一次误运行会打印 usage，而不是什么都不输出。想要模块而不想运行它
+-- 的库消费者就设这个旗标，测试就是这么做的。
 if rawget(_G, "__CCNBS_INSTALL_NO_AUTORUN") == nil
   and type(shell) == "table"
   and type(shell.getRunningProgram) == "function" then
 
   local code = installer.run({ ... })
   if code ~= 0 then
-    -- No os.exit in this project (it is forbidden, and Cobalt's is unreliable), so a
-    -- raised error is how a CC program reports failure to the shell. The message
-    -- names the program because "failed" alone told the user nothing.
+    -- 本项目里没有 os.exit（它被禁用了，而且 Cobalt 的实现不可靠），所以抛错就是
+    -- 一个 CC 程序向 shell 报告失败的方式。消息里点出程序名，因为光有 "failed" 什么
+    -- 都没告诉用户。
     error("install failed", 0)
   end
 end

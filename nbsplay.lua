@@ -1,44 +1,40 @@
 -- SPDX-License-Identifier: GPL-2.0-only
 -- Copyright (C) 2026 colorgarden
--- Part of CCNBSLib. Licensed under GPL-2.0; see LICENSE.
+-- CCNBSLib 的一部分。以 GPL-2.0 授权；见 LICENSE。
 --
 -- nbsplay.lua
 --
--- THE MINIMAL PLAYER: one URL, one song, a progress bar.
+-- 最小播放器：一个 URL、一首歌、一条进度条。
 --
 --     nbsplay <url>
 --
--- where `<url>` is a DIRECT LINK to an `.nbs` file.  There is no playlist, no
--- local-file scan and no search -- the library does the parsing and the
--- scheduling, and this file exists only to fetch a song, hand it over, and show
--- how far along it is.
+-- `<url>` 是指向 `.nbs` 文件的**直链**。这里没有播放列表、不扫描本地文件、也不
+-- 搜索——解析与调度都由库负责，本文件存在的意义只有：取回一首歌、交给库、显示它
+-- 播到哪儿了。
 --
 -- ===========================================================================
--- WHY IT STREAMS THE DOWNLOAD INSTEAD OF USING ONE BLOCKING CALL
+-- 为什么下载要分块流式读，而不是一次阻塞调用
 -- ===========================================================================
--- `http.get` hands back a handle that can be read in pieces, and the response
--- usually advertises a Content-Length.  Reading it in chunks instead of one
--- `read("*a")` costs two lines and buys a real download percentage rather than a
--- dead terminal while a few hundred kilobytes arrive.
+-- `http.get` 返回的 handle 可以分次读取，响应通常也会声明 Content-Length。分块读
+-- 而不是一次 `read("*a")`，只多两行代码，却能把「几百 KiB 正在传输」这段干等的
+-- 终端换成真实的下载百分比。
 --
 -- ===========================================================================
--- WHY IT IS BUILT ON `ccnbs`, NOT ON ITS OWN PARSER
+-- 为什么它建立在 `ccnbs` 之上，而不是自带解析器
 -- ===========================================================================
--- Every byte of parsing, analysis, scheduling and speaker routing belongs to the
--- library.  This file owns exactly three things: fetching, drawing a bar, and
--- shutting the speakers down safely on the way out.  If it re-implemented any
--- part of the pipeline, the CLI and the library would drift.
+-- 解析、分析、调度、扬声器路由——每一个字节都属于库。本文件只管三件事：拉取、
+-- 画进度条、退出时安全地停掉扬声器。只要它重新实现了流水线的任何一部分，CLI 与库
+-- 就会开始漂移。
 --
--- Compatibility: Lua 5.2 / CC:Tweaked Cobalt.  No integer division, no bitwise
--- operators, no utf8.*, no collectgarbage, no string.dump, no os.exit.  Every CC
--- global is read LAZILY, so this file is `require`-able in plain desktop Lua and
--- its pure parts are unit-testable.
+-- 兼容性：Lua 5.2 / CC:Tweaked Cobalt。不用整除、不用位运算、不用 utf8.*、不用
+-- collectgarbage、不用 string.dump、不用 os.exit。所有 CC 全局都是**惰性**读取的，
+-- 所以本文件在桌面版普通 Lua 里也能 `require`，它的纯函数部分可以单元测试。
 
 local cli = {}
 
 cli.VERSION = "1.0.0"
 
--- Read a CC global without making it a load-time dependency.
+-- 读取一个 CC 全局，但不让它变成加载期依赖。
 local function raw_global(name)
   local ok, value = pcall(rawget, _G, name)
   if ok then
@@ -47,15 +43,14 @@ local function raw_global(name)
   return nil
 end
 
--- FORWARD DECLARED, not defined here. `cli.choose_out_of_range` uses this, and Lua
--- resolves a name LEXICALLY AT COMPILE TIME -- so a `local function read_seam` declared
--- further down would leave that reference looking up a GLOBAL, which is nil, and the
--- interactive menu would raise the moment it was reached. Two earlier bugs in this
--- project's history were exactly this (`terminal` and `log`).
+-- 前向声明，不在这里定义。`cli.choose_out_of_range` 会用到它，而 Lua 在**编译期**
+-- 按词法解析名字——所以如果 `local function read_seam` 声明在更下面，上面那处引用
+-- 就会变成一次 GLOBAL 查找，结果是 nil，交互菜单一旦走到那里就会抛错。本项目历史上
+-- 有两个 bug 正是这个形状（`terminal` 和 `log`）。
 local read_seam
 
--- `try(ok, value)` unpacks a protected call.  Written as `pcall(require, "x")`
--- with a literal name so a dependency scan can see it.
+-- `try(ok, value)` 解包一次受保护调用。写成带字面量名字的 `pcall(require, "x")`，
+-- 这样依赖扫描工具能看见它。
 local function try(ok, value)
   if ok and type(value) == "table" then
     return value
@@ -63,23 +58,21 @@ local function try(ok, value)
   return nil
 end
 
--- The DEFAULTS.  Written as `pcall(require, "literal")` so a dependency
--- scan can see them, and held in locals the seam accessors below can
--- override -- a pipeline that cannot be driven from a test has only
--- compile-level assurance, and that is the gap this closes.
+-- 默认值。写成 `pcall(require, "字面量")` 是为了让依赖扫描能看见它们，并保存在
+-- local 变量里，好让下面的接缝访问器覆盖——一条无法从测试驱动的流水线只有编译期的
+-- 保证，这里堵上的就是这个缺口。
 local default_ccnbs = try(pcall(require, "ccnbslib"))
 local default_runtime = try(pcall(require, "player.runtime"))
 local default_clock = try(pcall(require, "player.clock"))
 
 -- ---------------------------------------------------------------------------
--- Pure parts -- these are what the spec drives, because they are the parts where
--- a mistake is silent (a bar that never fills, a clock that reads 0:00)
+-- 纯函数部分 —— 规格驱动测试针对的正是它们，因为这里的错误是**静默**的
+-- （进度条永远填不满、时钟永远显示 0:00）
 -- ---------------------------------------------------------------------------
 
--- The four out-of-range policies, with the one line each that a user needs in order
--- to choose. The library owns the VALUES (player/mapping.lua); this table owns the
--- wording, because presenting a choice is the CLI's job and the library never writes
--- a sentence.
+-- 四种越界策略，每条附一句用户做选择时需要的话。**值**归库所有
+-- （player/mapping.lua）；这张表只管**措辞**，因为呈现选项是 CLI 的职责，而库
+-- 从不写句子。
 cli.OUT_OF_RANGE_CHOICES = {
   {
     value = "shift",
@@ -103,7 +96,7 @@ cli.OUT_OF_RANGE_CHOICES = {
   },
 }
 
--- cli.usage() -> the two lines a user sees when they run it wrong.
+-- cli.usage() -> 用户用错时看到的那几行。
 function cli.usage()
   return "usage: nbsplay [--debug] [--policy <name>] [-f] <url>",
     "  <url> is a direct link to a .nbs file",
@@ -116,9 +109,9 @@ function cli.usage()
 
 -- cli.parse_url(argv) -> url | nil, error
 --
--- The FIRST argument that looks like a URL wins, so a stray flag cannot be
--- mistaken for one.  Anything that is not http/https is rejected here rather
--- than fetched, because a typo should cost a message, not a network round trip.
+-- **第一个**看起来像 URL 的参数胜出，所以一个走失的 flag 不会被误当成 URL。不是
+-- http/https 的一律在这里拒绝、而不是去拉取，因为一个笔误只该换来一条消息，而不是
+-- 一次网络往返。
 function cli.parse_url(argv)
   if type(argv) ~= "table" then
     return nil, "no arguments"
@@ -134,9 +127,8 @@ function cli.parse_url(argv)
   return nil, "no http:// or https:// URL given"
 end
 
--- The native key range, read from the library when it exposes one and falling back to
--- NBS's own documented bounds. Read rather than hardcoded so the CLI cannot drift from
--- the mapping that actually decides what is in range.
+-- 原生 key 范围：库若暴露了就取自库，否则退回 NBS 自己文档里的边界。读取而非硬编码，
+-- 这样 CLI 就不会与真正决定「什么算在范围内」的那份映射漂移。
 local function native_range()
   local module_ok, mapping = pcall(require, "player.mapping")
   if module_ok and type(mapping) == "table"
@@ -153,18 +145,17 @@ end
 
 -- cli.describe_warning(code, args) -> string
 --
--- The library hands over a BARE CODE and never a sentence -- that is the contract, and
--- the prose renderer was deleted with the interface on purpose. So the CLI is where a
--- code becomes something a person can act on, and this is the one place that knows how.
+-- 库交出来的是**裸码**、从不给句子——这是契约，散文渲染器是随界面一起**故意**删掉的。
+-- 所以「把码变成人能据以行动的话」是 CLI 的活，而这里是唯一知道怎么干的地方。
 --
--- PURE, so every message is pinned by the spec without needing to play a song.
+-- **纯函数**，所以每条消息都能被规格钉住，不需要真的放一首歌。
 function cli.describe_warning(code, args)
   args = type(args) == "table" and args or {}
 
   if code == "extended-range" then
-    -- Two different causes share this code, and they need different advice. Above the
-    -- native range the extranotes pack registers `_1`; below it, `_-1`. The library
-    -- reports the song's keys; which end is out decides whether the pack helps.
+    -- 同一个码背后有两种成因，给出的建议也不同。高于原生范围时 extranotes 材质包注册
+    -- 的是 `_1`；低于时是 `_-1`。库报告的是歌曲的 key；到底哪一端越界，决定了装上
+    -- 材质包有没有用。
     local native_min, native_max = native_bounds()
     return string.format(
       "notes reach key %s..%s, outside the native %s..%s -- install the extranotes "
@@ -195,25 +186,21 @@ function cli.describe_warning(code, args)
     return "a trumpet note was clamped to the speaker's 0.5..2.0 speed range"
   end
 
-  -- An unrecognised code still gets reported: a warning nobody mentioned is worse
-  -- than one with a terse message.
+  -- 无法识别的码仍然要被报出来：一条没人提起过的警告，比一条措辞简短的警告更糟。
   return "warning: " .. tostring(code)
 end
 
 -- cli.choose_out_of_range(opts, probe, say, emit) -> policy string
 --
--- THE INTERACTIVE CHOICE, and the reason it exists: a note outside its recording's
--- octave has no single right answer. Playing a shifted recording gets the pitch right
--- but needs a resource pack; passing it through is always audible but the client
--- flattens it; clamping is predictable and wrong; dropping is silence. The user is the
--- only one who knows which they want, so they are asked.
+-- **交互式选择**，以及它存在的理由：一个超出自身录音八度的音符没有唯一正解。播一份
+-- 偏移录音音高是对的，但需要材质包；原样透传一定能听见，但客户端会把它压平；夹取
+-- 可预期却是错的；丢弃就是静音。只有用户知道自己想要哪个，所以去问用户。
 --
--- `probe` is an analysis computed with PASSTHROUGH, so the reported key range is the
--- song's own regardless of any later choice.
+-- `probe` 是用 PASSTHROUGH 算出来的分析，所以报告的 key 范围始终是歌曲自身的，
+-- 与之后的任何选择无关。
 --
--- ANY NON-ANSWER FALLS BACK TO SHIFT, which is the library's own default. A blank
--- line, unreadable input, or a typo must not abort a playback the user asked for --
--- the same reasoning the installer's mirror menu uses.
+-- **任何非答案都退回 SHIFT**，也就是库自己的默认值。空行、读不进来的输入、或一个
+-- 笔误，都不该中断用户主动要求的播放——安装器的镜像菜单用的也是同一套理由。
 function cli.choose_out_of_range(opts, probe, say, emit, prompt)
   local min_key, max_key = native_bounds()
 
@@ -232,12 +219,11 @@ function cli.choose_out_of_range(opts, probe, say, emit, prompt)
   end
   emit("")
 
-  -- THE PROMPT IS WRITTEN BY US, and `read` is called bare.
+  -- 提示语由**我们自己写出**，`read` 则裸调用。
   --
-  -- `read`'s first parameter is a replace character, not a prompt, so the old
-  -- `read("choose 1-4 (blank = shift): ")` displayed NO prompt and echoed each
-  -- keystroke as the letter "c" -- the first character of that string. Two visible
-  -- symptoms, one cause.
+  -- `read` 的第一个参数是**替换字符**，不是提示语，所以旧代码
+  -- `read("choose 1-4 (blank = shift): ")` **不显示**任何提示，并且把每次按键都
+  -- 回显成字母 "c"——那个字符串的第一个字符。两个看得见的症状，同一个成因。
   if type(prompt) == "function" then
     prompt("choose 1-4 (blank = shift): ")
   end
@@ -267,18 +253,16 @@ end
 
 -- cli.parse_argv(argv) -> url | nil, debug, error
 --
--- Separated from parse_url so the URL rule stays exactly as tested: a flag is
--- REMOVED here rather than being tolerated inside the URL matcher, so any future
--- flag cannot quietly change what counts as a URL.
+-- 与 parse_url 分开，是为了让 URL 规则保持被测过的样子：flag 在这里被**摘掉**，
+-- 而不是在 URL 匹配器内部被容忍，这样将来新增的任何 flag 都无法悄悄改变「什么算
+-- URL」。
 -- cli.parse_argv(argv) -> url | nil, debug, policy | nil, error
 --
--- Flags may appear anywhere. `--policy <name>` SKIPS the interactive out-of-range menu,
--- which an unattended caller -- a startup file, a script -- cannot answer. Interactive
--- remains the default, because the choice genuinely depends on whether the listener has
--- the resource pack and on what they would rather hear.
+-- flag 可以出现在任意位置。`--policy <name>` 会**跳过**交互式越界菜单，因为无人值守
+-- 的调用方——启动文件、脚本——无法回答它。交互式仍是默认，因为这个选择真的取决于
+-- 听者有没有材质包、以及他们更愿意听什么。
 --
--- An unknown policy name is refused rather than ignored: silently falling back would
--- play the song a different way from the one that was asked for.
+-- 未知的策略名一律拒绝而不是忽略：静默回退会用一种不同于所求的方式播放歌曲。
 function cli.parse_argv(argv)
   local debug = false
   local policy = nil
@@ -293,8 +277,8 @@ function cli.parse_argv(argv)
         debug = true
         index = index + 1
       elseif value == "--force" or value == "-f" then
-        -- Play even when the speakers cannot hold the song. Dropping notes is the
-        -- user's call once they can see the counts; this is how they make it.
+        -- 即使扬声器装不下整首歌也照播。用户一旦看见了数字，丢音符就是他们的决定；
+        -- 这就是他们做决定的方式。
         force = true
         index = index + 1
       elseif value == "--policy" then
@@ -306,7 +290,7 @@ function cli.parse_argv(argv)
         policy = name
         index = index + 2
       elseif type(value) == "string" and value:sub(1, 8) == "--policy" then
-        -- "=form": --policy=shift
+        -- "=form" 形式：--policy=shift
         local name = value:sub(10)
         if not cli.is_policy(name) then
           return nil, debug, nil, false,
@@ -325,7 +309,7 @@ function cli.parse_argv(argv)
   return url, debug, policy, force, err
 end
 
--- cli.policy_names() -> the accepted policy names, in menu order.
+-- cli.policy_names() -> 被接受的策略名，按菜单顺序。
 function cli.policy_names()
   local names = {}
   for index = 1, #cli.OUT_OF_RANGE_CHOICES do
@@ -347,7 +331,7 @@ function cli.is_policy(value)
   return false
 end
 
--- cli.format_time(ms) -> "M:SS", clamped at zero and tolerant of nonsense.
+-- cli.format_time(ms) -> "M:SS"，夹到零，并容忍无意义输入。
 function cli.format_time(ms)
   local value = tonumber(ms) or 0
   if value < 0 then
@@ -358,12 +342,11 @@ function cli.format_time(ms)
   return string.format("%d:%02d", minutes, seconds - minutes * 60)
 end
 
--- cli.render_bar(frac, width) -> a string of exactly `width` characters.
+-- cli.render_bar(frac, width) -> 恰好 `width` 个字符的字符串。
 --
--- The caller draws it between its own brackets; this only produces the cells, so
--- the arithmetic can be asserted without a terminal.  A non-numeric or
--- out-of-range fraction is clamped -- a bar that overflows its own width is a
--- rendering bug that looks like a progress bug.
+-- 调用方把它画进自己的方括号之间；本函数只产格子，所以这段算术不需要终端就能断言。
+-- 非数值或越界的比例会被夹取——一根溢出自身宽度的进度条是**渲染** bug，看起来却像
+-- **进度** bug。
 function cli.render_bar(frac, width)
   local cells = math.floor(tonumber(width) or 0)
   if cells < 1 then
@@ -382,7 +365,7 @@ function cli.render_bar(frac, width)
   return string.rep("#", filled) .. string.rep("-", cells - filled)
 end
 
--- cli.percent(frac) -> an integer 0..100, for the label beside the bar.
+-- cli.percent(frac) -> 0..100 的整数，用于进度条旁边的标签。
 function cli.percent(frac)
   local value = tonumber(frac) or 0
   if value < 0 then
@@ -393,15 +376,13 @@ function cli.percent(frac)
   return math.floor(value * 100 + 0.5)
 end
 
--- `terminal` is defined further down with the other seams; it is FORWARD
--- DECLARED here because progress_line reads it, and Lua resolves locals
--- lexically at COMPILE time -- a later `local function` would leave this
--- reference a global lookup, which is nil.
+-- `terminal` 在下面与其他接缝一起定义；它在这里**前向声明**，因为 progress_line
+-- 会读它，而 Lua 在**编译期**按词法解析 local——一个更靠后的 `local function`
+-- 会让这里变成一次全局查找，结果是 nil。
 local terminal
 
--- cli.speaker_count(n) -> "<n> speaker" / "<n> speakers".
--- A raw "%d speaker(s)" is the kind of thing that never gets cleaned up, so it is
--- a function, and therefore testable.
+-- cli.speaker_count(n) -> "<n> speaker" / "<n> speakers"。
+-- 裸的 "%d speaker(s)" 就是那种永远不会被清理的东西，所以它是个函数，因而可测。
 function cli.speaker_count(count)
   local number = tonumber(count) or 0
   if number < 0 then
@@ -413,16 +394,15 @@ function cli.speaker_count(count)
   return tostring(number) .. " speakers"
 end
 
--- cli.display_width(text) -> the number of COLUMNS text occupies
+-- cli.display_width(text) -> text 占用的**列数**
 --
--- Not the character count: on a CC:T terminal a CJK glyph takes TWO cells. Counting
--- characters would let a Chinese line pass a width check and then be clipped -- the
--- exact failure this function exists to prevent -- and song titles and layer names are
--- routinely CJK, so it is not a hypothetical.
+-- 不是字符数：在 CC:T 终端上一个 CJK 字形占**两格**。按字符计数会让一行中文通过宽度
+-- 检查、随后被裁掉——这正是本函数要防的失败——而歌曲名与图层名经常是 CJK，所以这
+-- 不是假设出来的情形。
 --
--- The test is the common wide range (CJK and the fullwidth forms) rather than a whole
--- Unicode East Asian Width table: a Lua module running on a 1 MB computer disk is not
--- the place for one, and everything a .nbs file carries is ASCII, CP1252 or that range.
+-- 判定用的是常见宽字符区间（CJK 与全角形式），而不是一整张 Unicode East Asian Width
+-- 表：一个跑在 1 MB 电脑磁盘上的 Lua 模块不该放那种东西，而且 .nbs 文件携带的一切
+-- 无非是 ASCII、CP1252 或那个区间。
 function cli.display_width(text)
   local value = tostring(text or "")
   local columns = 0
@@ -431,33 +411,32 @@ function cli.display_width(text)
     if byte < 0x80 then
       columns = columns + 1
     elseif byte >= 0xE0 and byte <= 0xEF then
-      -- A three-byte UTF-8 sequence: one character, two columns.
+      -- 三字节 UTF-8 序列：一个字符，两列。
       columns = columns + 2
     elseif byte >= 0x80 and byte < 0xC0 then
-      -- A CONTINUATION byte, already counted with its lead byte.
+      -- 一个**续接字节**，已经随它的首字节一起计过。
       columns = columns + 0
     else
-      -- A two- or four-byte sequence: one column, which is right for Latin/Greek/
-      -- Cyrillic and good enough outside the BMP.
+      -- 两字节或四字节序列：算一列，这对拉丁/希腊/西里尔字母是对的，在 BMP 之外
+      -- 也够用。
       columns = columns + 1
     end
   end
   return columns
 end
 
--- cli.wrap_text(text, width) -> array of lines
+-- cli.wrap_text(text, width) -> 行数组
 --
--- `term.write` DOES NOT WRAP. AGENTS.md section 3 records the measurement, and
--- `TextBuffer.write` bounds-checks past the right edge, so the overflow is simply GONE.
--- A 77-character menu on a 51-column terminal therefore read "…-- play a different
--- RECO" and the user had no way to learn what the options were.
+-- `term.write` **不折行**。AGENTS.md 第 3 节记录了那次实测，而 `TextBuffer.write`
+-- 会对越过右边缘的部分做边界检查，于是溢出的内容干脆**消失**。所以一个 51 列的终端上
+-- 一条 77 字符的菜单会读成 "…-- play a different RECO"，用户根本无从得知选项是什么。
 --
--- So the CLI wraps for itself:
---   * on SPACES where possible, so a sentence stays readable;
---   * HARD, inside a word longer than the line -- a URL or a sound name has no spaces
---     and overflowing would be clipped, which is the failure being fixed;
---   * an existing "\n" starts a new line;
---   * a non-positive width never loops: it falls back to one column.
+-- 所以 CLI 自己折行：
+--   * 尽量在**空格**处折，让句子保持可读；
+--   * 单词比整行还长时**硬折**——URL 或音效名里没有空格，溢出就会被裁掉，而那正是
+--     要修掉的失败；
+--   * 已有的 "\n" 开始新的一行；
+--   * 非正宽度绝不会死循环：退回一列。
 function cli.wrap_text(text, width)
   local limit = tonumber(width) or 0
   if limit < 1 then
@@ -467,9 +446,9 @@ function cli.wrap_text(text, width)
   local source = tostring(text or "")
   local out = {}
 
-  -- Split on newlines first: an explicit break is a break.
+  -- 先按换行拆：一个显式的换行就是一次换行。
   for paragraph in (source .. "\n"):gmatch("([^\n]*)\n") do
-    -- Also handle CR, so a message built with CRLF does not carry a stray character.
+    -- 顺带处理 CR，这样用 CRLF 拼出来的消息不会带着一个多余字符。
     paragraph = paragraph:gsub("\r", "")
 
     if cli.display_width(paragraph) <= limit then
@@ -488,7 +467,7 @@ function cli.wrap_text(text, width)
             line = ""
           end
 
-          -- The word alone may still be too long: break it by characters.
+          -- 这个单词单独拿出来可能仍然太长：按字符把它拆开。
           while cli.display_width(word) > limit do
             local piece = ""
             local consumed = 0
@@ -502,8 +481,8 @@ function cli.wrap_text(text, width)
             end
 
             if consumed == 0 then
-              -- A single character wider than the line. Emit it alone rather than
-              -- spinning forever; one clipped character beats a hang.
+              -- 单个字符比整行还宽。把它单独吐出，而不是永远转下去；裁掉一个字符好过
+              -- 卡死。
               out[#out + 1] = word:sub(1, 1)
               word = word:sub(2)
             else
@@ -527,22 +506,19 @@ function cli.wrap_text(text, width)
   return out
 end
 
--- cli.progress_line(label, frac, extras, columns) -> a line that FITS.
+-- cli.progress_line(label, frac, extras, columns) -> 一条**装得下**的行。
 --
--- PURE, apart from reading the terminal size when `columns` is not given, so the
--- arithmetic can be asserted without a terminal.
+-- 除了在未给出 `columns` 时读取终端尺寸之外，它是**纯函数**，所以这段算术不需要终端
+-- 就能断言。
 --
--- The line is kept strictly SHORTER than the terminal so nothing is CLIPPED.
--- `term.write` does not wrap (measured: width + 5 characters left the row
--- unchanged and the cursor at column 57) -- the text simply runs off the right
--- edge, and TextBuffer.write bounds-checks, so it is lost, not fatal. Fitting is
--- therefore about not losing characters, which matters here because the
--- percentage and the clock are the point of the line.
+-- 这一行被刻意保持**严格短于**终端，好让任何东西都不被**裁掉**。`term.write` 不折行
+-- （实测：写完 width + 5 个字符后行没变、光标停在 57 列）——文本只是直接越过右边缘，
+-- 而 TextBuffer.write 会做边界检查，于是它丢失了，但不致命。所以「装得下」要解决的是
+-- 不丢字符，这在这里很重要，因为百分比和时钟正是这一行的重点。
 --
--- The bar and the percentage are never dropped, because they ARE the progress.
--- `extras` are trailing fragments in priority order (most important first) and are
--- dropped from the end until the line fits. If not even a small bar fits, it
--- degrades to a bare percentage, with the label shortened only as a last resort.
+-- 进度条和百分比永远不会被丢掉，因为它们**就是**进度。`extras` 是按优先级排列的尾部
+-- 片段（最重要的在前），会从末尾开始逐个丢弃直到这一行装得下。如果连一小段进度条都
+-- 装不下，就退化成只有百分比，而标签只在万不得已时才缩短。
 function cli.progress_line(label, frac, extras, columns)
   local text = tostring(label or "")
   local width = tonumber(columns)
@@ -567,17 +543,15 @@ function cli.progress_line(label, frac, extras, columns)
     end
   end
 
-  -- Longest first, so the most informative version that fits is the one used.
+  -- 最长的在前，这样被采用的版本是装得下的最有信息量的那个。
   for count = #fragments, 0, -1 do
     local tail = table.concat(fragments, "", 1, count)
-    -- Count the fixed characters ONE TERM AT A TIME rather than as a total. An
-    -- off-by-one here was got wrong twice, and the consequence is characters
-    -- silently dropped off the right edge -- so it is spelled out rather than
-    -- trusted:
+    -- 固定字符要**一项一项**去数，而不是当成一个总数。这里差一位曾经错了两回，而后果
+    -- 是字符被静默地从右边缘丢出去——所以宁可把它写清楚，也不靠「应该没错」：
     --
-    --   " ["      2   before the bar
-    --   "] "      2   after the bar
-    --   "100%"    4   `%3d%%` is four characters for every value from 0 to 999
+    --   " ["      2   进度条之前
+    --   "] "      2   进度条之后
+    --   "100%"    4   `%3d%%` 对 0 到 999 的每个值都是四个字符
     --   tail      #tail
     local fixed = 2 + 2 + 4 + #tail
     local room = width - 1 - #text - fixed
@@ -587,8 +561,7 @@ function cli.progress_line(label, frac, extras, columns)
     end
   end
 
-  -- Nothing fits: a percentage alone still tells the user something is happening,
-  -- with the label shortened if even that would overflow.
+  -- 什么都装不下：只有百分比也仍然告诉用户有事在发生，若连它都会溢出，就缩短标签。
   local bare = string.format("%3d%%", cli.percent(frac))
   local room = width - 2 - #bare
   if room < 0 then
@@ -604,7 +577,7 @@ function cli.progress_line(label, frac, extras, columns)
   return name .. " " .. bare
 end
 
--- cli.duration_ms(events) -> the song's length in ms, from its last event.
+-- cli.duration_ms(events) -> 歌曲长度（毫秒），取自最后一个事件。
 function cli.duration_ms(events)
   if type(events) ~= "table" or #events == 0 then
     return 0
@@ -618,7 +591,7 @@ function cli.duration_ms(events)
 end
 
 -- ---------------------------------------------------------------------------
--- Default seams -- injected by the spec, read lazily here
+-- 默认接缝 —— 由规格注入，在这里惰性读取
 -- ---------------------------------------------------------------------------
 
 local seams = {}
@@ -640,9 +613,8 @@ terminal = function()
   return seams.term or raw_global("term")
 end
 
--- library() -> the ccnbslib table, injected or the real one.  EVERY use in
--- run() goes through here, so a test can supply a fake library: no speakers,
--- no clock, no waiting, and the whole path becomes assertable.
+-- library() -> ccnbslib 表，注入的或真实的那份。run() 里**每一处**使用都走这里，
+-- 所以测试可以喂一个假库：没有扬声器、没有时钟、不用等待，整条路径都变得可断言。
 local function library()
   if type(seams.ccnbs) == "table" then
     return seams.ccnbs
@@ -650,7 +622,7 @@ local function library()
   return default_ccnbs
 end
 
--- runtime_module() -> player.runtime, injected or the real one.
+-- runtime_module() -> player.runtime，注入的或真实的那份。
 local function runtime_module()
   if type(seams.runtime) == "table" then
     return seams.runtime
@@ -658,13 +630,12 @@ local function runtime_module()
   return default_runtime
 end
 
--- current_clock() -> the clock playback is timed by.
+-- current_clock() -> 为播放计时的那个时钟。
 --
--- THE CLOCK MUST BE PUMPED, not merely handed over. `after()` arms a timer;
--- the callback runs only when `run_due()` drains `timer` events and dispatches
--- the matching handle. Polling with os.sleep does NOT work: os.sleep pulls and
--- discards every event until its own timer fires, so the song's timers are
--- consumed with their callbacks never invoked -- silence, reported as success.
+-- 时钟必须被**泵动**，不是交出去就算完。`after()` 只是装上定时器；回调只有在
+-- `run_due()` 把 `timer` 事件排干并派发对应 handle 时才会跑。用 os.sleep 轮询**不**
+-- 可行：os.sleep 会把事件全部拉走并丢弃，直到自己的定时器触发，于是歌曲的定时器被消费
+-- 掉、回调从未被调用——静音，却报告为成功。
 local function current_clock()
   if type(seams.clock) == "table" then
     return seams.clock
@@ -675,12 +646,11 @@ local function current_clock()
   return nil
 end
 
--- read_seam(prompt): how the CLI asks the user a question.
+-- read_seam(prompt)：CLI 向用户提问的方式。
 --
--- Injected through opts.read so a test can answer it. An interactive path that was
--- never exercised is how the autorun bug survived -- written, never run, silently
--- wrong. Returns nil when there is no way to read, which callers treat as "said
--- nothing".
+-- 通过 opts.read 注入，好让测试来回答。一条从未被走过的交互路径，正是 autorun bug
+-- 存活下来的原因——写了、从没跑过、静默地错。无法读取时返回 nil，调用方把它当作
+-- 「什么也没说」。
 read_seam = function(opts)
   if type(opts) == "table" and type(opts.read) == "function" then
     return opts.read()
@@ -689,15 +659,13 @@ read_seam = function(opts)
   if type(reader) ~= "function" then
     return nil
   end
-  -- NO ARGUMENTS. `read`'s first parameter is a REPLACE CHARACTER (for hiding a
-  -- password), not a prompt -- `read([replaceChar [, history [, completeFn
-  -- [, default]]]])` -- and it keeps only that string's first character. Called as
-  -- `read("choose 1-4: ")` it therefore rendered nothing at all and echoed every
-  -- keystroke as the letter "c", which is the "why does typing 1 show a c" bug.
+  -- 不传任何参数。`read` 的第一个参数是**替换字符**（用于隐藏密码），不是提示语——
+  -- `read([replaceChar [, history [, completeFn [, default]]]])`——而且它只取那个
+  -- 字符串的第一个字符。所以按 `read("choose 1-4: ")` 调用时，它什么都不渲染，并且
+  -- 把每次按键都回显成字母 "c"，也就是那个「为什么输入 1 显示 c」的 bug。
   --
-  -- There is no prompt parameter to pass. The prompt must be WRITTEN first, which is
-  -- what `prompt` on the writer is for, and what CC's own documentation does:
-  -- `write("> "); local msg = read()`.
+  -- 根本没有提示语参数可传。提示语必须先被**写出**，这正是 writer 上 `prompt` 的
+  -- 用途，也是 CC 自己文档里的做法：`write("> "); local msg = read()`。
   local ok, answer = pcall(reader)
   if not ok then
     return nil
@@ -706,82 +674,72 @@ read_seam = function(opts)
 end
 
 -- ---------------------------------------------------------------------------
--- Output
+-- 输出
 -- ---------------------------------------------------------------------------
--- One line is rewritten in place rather than appended, because a progress bar that
--- is appended is just a log.  Every line goes through the writer `make_writer`
--- returns -- or through `opts.write`, when a caller supplies one -- so a test can
--- capture the exact strings, and so there is a single place that knows how a row is
--- advanced.
+-- 有一行是**原地重写**而不是追加的，因为一根被追加的进度条就只是一份日志。每一行都
+-- 经过 `make_writer` 返回的 writer——或者调用方提供 `opts.write` 时经过它——这样测试
+-- 就能捕获到确切的字符串，也让「一行是怎么往下走的」只有一个地方知道。
 --
--- THE OUTPUT HAS ONE SHAPE
+-- 输出只有一种形状
 --
---   nbsplay: <status>            a permanent line; the cursor moves down a row
---   nbsplay: E_CODE: <detail>    a failure; it exits non-zero
---   <bar>  <pct>  <detail>       a LIVE line, refreshed in place
---   usage: ...                   help, unprefixed
+--   nbsplay: <status>            一条永久行；光标下移一行
+--   nbsplay: E_CODE: <detail>    一次失败；进程非零退出
+--   <bar>  <pct>  <detail>       一条实时行，原地刷新
+--   usage: ...                   帮助文本，无前缀
 --
--- A permanent line is never overwritten: the cursor is moved down past it, so it
--- stays. A live line is redrawn on the same row, so a progress bar animates instead
--- of filling the screen with every step it ever took.
+-- 永久行永远不会被覆盖：光标会越过它往下走，所以它留了下来。实时行在同一行上重画，
+-- 所以进度条是动的，而不是把它走过的每一步都填满屏幕。
 --
--- "Moved down" is NOT `term.write("\n")`, which does no such thing -- see the long
--- note on `make_writer` for the measurement.
+-- 「下移一行」**不是** `term.write("\n")`，后者根本做不到这件事——实测见 `make_writer`
+-- 上的长注释。
 --
--- EVERY FAILURE PATH PRINTS `E_CODE: detail`.  The project's convention is
--- that machine-readable output is a BARE CODE and the caller words it -- the
--- library returns `{code = "E_..."}` and never a sentence.  The CLI follows
--- the same rule so a script can branch on the code, and so the codes are
--- stable enough to assert on.  All ASCII, all greppable:
+-- **每一条失败路径都打印 `E_CODE: detail`。** 本项目的约定是：机器可读的输出是**裸码**，
+-- 措辞由调用方负责——库返回 `{code = "E_..."}`、从不返回句子。CLI 遵循同一条规则，这样
+-- 脚本可以按码分支，码也稳定到足以断言。全部 ASCII，全部可 grep：
 --
---   E_USAGE          no usable URL on the command line
---   E_NO_LIBRARY     ccnbslib.lua is not installed
---   E_HTTP_DISABLED  this computer has no http API
---   E_HTTP           the request itself failed; CC's own reason follows, e.g.
---                    `E_HTTP: Domain not permitted` or `E_HTTP: Not Found`
---   E_DOWNLOAD       reading the response failed part way
---   E_EMPTY          the server answered with nothing
---   E_DECODE         the library rejected the bytes (its code follows)
---   E_NO_SPEAKER     no speaker peripheral is attached
---   E_NO_CLOCK       player.clock is missing, or cannot be driven
---   E_CLOCK_FROZEN   the clock does not advance with real time
---   E_CLOCK_SCALE    the clock's unit is not real milliseconds
---   E_DISPATCH       the clock stopped early, or a timer callback raised
---   E_PLAY           the library returned no usable session
+--   E_USAGE          命令行上没有可用的 URL
+--   E_NO_LIBRARY     ccnbslib.lua 没有安装
+--   E_HTTP_DISABLED  这台电脑没有 http API
+--   E_HTTP           请求本身失败；后面跟着 CC 自己的原因，例如
+--                    `E_HTTP: Domain not permitted` 或 `E_HTTP: Not Found`
+--   E_DOWNLOAD       读取响应途中失败
+--   E_EMPTY          服务器什么也没返回
+--   E_DECODE         库拒绝了这些字节（后面跟着它的码）
+--   E_NO_SPEAKER     没有接上任何 speaker 外设
+--   E_NO_CLOCK       player.clock 缺失，或无法被驱动
+--   E_CLOCK_FROZEN   时钟不随真实时间前进
+--   E_CLOCK_SCALE    时钟的单位不是真实毫秒
+--   E_DISPATCH       时钟提前停了，或某个定时器回调抛了错
+--   E_PLAY           库没有返回可用的会话
 
 -- make_writer() -> { line = fn, refresh = fn }
 --
--- TWO KINDS OF OUTPUT, and conflating them destroys the screen:
+-- **两种输出**，把它们混为一谈会毁掉屏幕：
 --
---   line(text)     a PERMANENT message: written once, then the cursor moves DOWN a
---                  row. Nothing written later can erase it.
---   refresh(text)  a LIVE line, rewritten in place: the cursor is left at the start
---                  of the same row, so a progress bar animates rather than filling
---                  the screen with every step it ever took.
+--   line(text)     **永久**消息：写一次，然后光标**下移**一行。之后写什么都擦不掉它。
+--   refresh(text)  **实时**行，原地重写：光标被留在同一行的行首，所以进度条是动的，
+--                  而不是把它走过的每一步都填满屏幕。
 --
--- A NEWLINE IS NOT `term.write("\n")`.  MEASURED on CraftOS-PC 2.8.3, because the
--- documentation and the behaviour had to agree before this was written at all:
+-- 换行**不是** `term.write("\n")`。在 CraftOS-PC 2.8.3 上**实测**，因为动手写之前
+-- 文档与行为必须先对上：
 --
 --   after write("AAAA")     x=5  y=1
---   after write("\n")       x=6  y=1     <- the ROW did not change
---   after write("BBBB")     x=10 y=1     <- so both landed on row 1
+--   after write("\n")       x=6  y=1     <- 行**没有**变
+--   after write("BBBB")     x=10 y=1     <- 于是两者都落在第 1 行
 --
--- `term.write` is documented as not handling "line breaks or word wrapping", and
--- TermAPI.java agrees -- it does `setCursorPos(getCursorX() + text.length(),
--- getCursorY())`.  So a "\n" sent through it is stored as an ordinary character and
--- advances the COLUMN by one. The previous version ended every permanent line with
--- exactly that, so each message overwrote the one before: the user saw a single
--- line, the last one. `bios.lua`'s own `write` shows how a row is really advanced --
--- setCursorPos(1, y + 1), or setCursorPos(1, height) then scroll(1) at the bottom.
+-- `term.write` 的文档写明它不处理 "line breaks or word wrapping"，TermAPI.java 也一致
+-- ——它做的是 `setCursorPos(getCursorX() + text.length(), getCursorY())`。所以经由它
+-- 发出的一个 "\n" 会被当作普通字符存下来，只把**列**推进一格。上一个版本每条永久行都以
+-- 它结尾，于是每条消息都覆盖了前一条：用户只看到一行——最后那一行。`bios.lua` 自己的
+-- `write` 展示了真正该怎么做——setCursorPos(1, y + 1)，或在底部时先
+-- setCursorPos(1, height) 再 scroll(1)。
 --
--- `term.write` does NOT wrap either (measured: writing width + 5 characters left
--- the cursor at column 57 with the row unchanged). Text past the right edge is
--- simply CLIPPED -- TextBuffer.write bounds-checks and does not raise -- so the
--- progress line still aims to FIT, but only so nothing is cut off, NOT because a
--- long line would scroll the screen. It would not.
+-- `term.write` 也**不**折行（实测：写完 width + 5 个字符后光标停在 57 列、行没变）。
+-- 越过右边缘的文本会被直接**裁掉**——TextBuffer.write 做边界检查且不抛错——所以进度行
+-- 仍然力求**装得下**，但这只是为了不让内容被切掉，**不是**因为长行会让屏幕滚动。它不会。
 --
--- clearLine() clears the WHOLE row, not just from the cursor onwards (also
--- measured), which is what makes clear-then-write the right pair.
+-- clearLine() 清的是**整行**，而不只是光标之后的部分（同样实测过），这正是「先清后写」
+-- 是正确组合的原因。
 local function make_writer()
   local term = terminal()
   local printer = raw_global("print")
@@ -795,27 +753,24 @@ local function make_writer()
   if type(term) ~= "table" or type(term.write) ~= "function"
     or type(term.getCursorPos) ~= "function"
     or type(term.setCursorPos) ~= "function" then
-    -- No cursor control, so a refresh CANNOT overwrite: it would be a new line
-    -- every time. Printing nothing for it keeps the real output readable, and the
-    -- permanent lines still carry the outcome.
+    -- 没有光标控制，所以 refresh **无法**覆盖：它会每次都变成新的一行。对它什么都不
+    -- 打印，能让真实输出保持可读，而永久行仍然承载结果。
     return {
       line = plain,
       wrapped = plain,
-      -- No cursor control, so there is no line to type on; `plain` is the least wrong
-      -- answer and this branch has no interactive reader anyway.
+      -- 没有光标控制，就没有可供输入的行；`plain` 是错得最少的答案，何况这个分支
+      -- 本来也没有交互式读取器。
       prompt = plain,
       refresh = function() end,
     }
   end
 
-  -- Is a live line on screen right now? Its row is simply WHEREVER THE CURSOR IS,
-  -- because `refresh` always leaves the cursor there. Nothing has to be remembered,
-  -- so this stays correct if the terminal is resized mid-song.
+  -- 此刻屏幕上有一条实时行吗？它所在的行就是**光标现在的位置**，因为 `refresh` 总是
+  -- 把光标留在那里。什么都不用记，所以即使歌曲播到一半终端被改变尺寸，这里也仍然正确。
   local live = false
 
-  -- Move down one row, scrolling at the bottom. This is the step `term.write` does
-  -- not take; it is copied from the `newLine` helper inside bios.lua's `write`,
-  -- which is the authority on it.
+  -- 下移一行，到底部则滚动。这正是 `term.write` 不会做的那一步；它是从 bios.lua 的
+  -- `write` 内部那个 `newLine` 辅助函数抄来的，而那是这件事的权威。
   local function advance()
     local _, row = term.getCursorPos()
     if type(row) ~= "number" then
@@ -840,9 +795,8 @@ local function make_writer()
     end
   end
 
-  -- How many columns the terminal has, measured once. A terminal that cannot report
-  -- its size falls back to the CC:T default rather than to zero, which would wrap
-  -- every message to one character per line.
+  -- 终端有多少列，只测量一次。无法报告自身尺寸的终端，退回 CC:T 的默认值而不是零，
+  -- 后者会把每条消息都折成一行一个字符。
   local columns = 51
   if type(term.getSize) == "function" then
     local ok, measured = pcall(term.getSize)
@@ -853,8 +807,8 @@ local function make_writer()
 
   local function write_line(text)
     if live then
-      -- Take over the live line's row rather than leaving a blank one behind.
-      -- The cursor is still on that row, so clearLine is all it takes.
+      -- 接管实时行所占的那一行，而不是在身后留下一个空行。光标仍停在这一行，所以
+      -- clearLine 就够了。
       term.clearLine()
       live = false
     end
@@ -864,24 +818,23 @@ local function make_writer()
 
   return {
     line = write_line,
-    -- A message WRAPPED to the terminal.
+    -- 一条**折行**到终端的消息。
     --
-    -- `term.write` clips rather than wraps, so anything longer than the screen loses
-    -- its right-hand end silently. The out-of-range menu proved it: its lines are 77
-    -- to 80 characters, the default terminal is 51 columns, and the user saw
-    -- "…-- play a different RECO" with no way to find out what the options were.
+    -- `term.write` 是裁剪而不是折行，所以任何长过屏幕的内容都会静默地丢掉右端。越界
+    -- 菜单证明了这一点：它的行是 77 到 80 个字符，默认终端是 51 列，用户看到的就是
+    -- "…-- play a different RECO"，且无从得知选项到底是什么。
     wrapped = function(text)
       local lines = cli.wrap_text(text, columns)
       for index = 1, #lines do
         write_line(lines[index])
       end
     end,
-    -- A PROMPT: written where the cursor is, and the cursor is LEFT there, because the
-    -- user types on this line and `read` echoes from the current position. Advancing
-    -- would put the answer on the following line and leave the prompt stranded.
+    -- 一条**提示语**：写在光标所在处，并且把光标**留在那里**，因为用户就在这一行上输入，
+    -- 而 `read` 从当前位置回显。若下移一行，答案就会落到下一行，提示语也会被孤零零地
+    -- 留在原地。
     --
-    -- This exists because `read` takes no prompt argument -- see read_seam -- so the
-    -- prompt has to be written by us.
+    -- 它之所以存在，是因为 `read` 不接受提示语参数——见 read_seam——所以提示语必须由
+    -- 我们自己写出。
     prompt = function(text)
       if live then
         term.clearLine()
@@ -905,50 +858,46 @@ local function make_writer()
 end
 
 -- ---------------------------------------------------------------------------
--- Fetching
+-- 拉取
 -- ---------------------------------------------------------------------------
 
 -- cli.fetch(url, on_progress) -> body | nil, code, detail
 --
--- Reads in chunks so the caller can show a percentage.  A response with no
--- Content-Length simply reports progress without a total, which is why
--- `on_progress` receives `(received, total)` and total may be nil.
+-- 分块读取，好让调用方显示百分比。没有 Content-Length 的响应只是「没有总数」地上报
+-- 进度，这就是 `on_progress` 收到 `(received, total)`、而 total 可以为 nil 的原因。
 --
--- THE HANDLE'S METHODS TAKE NO `self` -- call them DOT-STYLE.
+-- **这个 handle 的方法不接收 `self`——必须用点号调用。**
 --
--- CC:Tweaked registers them with @LuaFunction on Java methods that have no
--- self parameter (HttpResponseHandle.java), and the ROM's own example is
--- `request.readAll()`.  Measured on CraftOS-PC against a FILE handle, which the
--- response handle's javadoc says shares its methods and which uses the same
--- machinery:
+-- CC:Tweaked 在**没有** self 参数的 Java 方法上以 @LuaFunction 注册它们
+-- （HttpResponseHandle.java），ROM 自己的例子就是 `request.readAll()`。在 CraftOS-PC
+-- 上对着一个 **FILE** handle 实测过——响应 handle 的 javadoc 说它与文件 handle 共用
+-- 方法，走的是同一套机制：
 --
---     h.read(5)      -> "01234"   five characters           -- correct
---     h.read(h, 5)   -> "0"       the table became the count -- wrong
+--     h.read(5)      -> "01234"   五个字符                -- 正确
+--     h.read(h, 5)   -> "0"       table 变成了 count      -- 错误
 --
--- So passing the handle back in makes `read` receive a table where a number
--- belongs.  On real CC:Tweaked that raises, and the caller sees a failed
--- download -- which is precisely what happened when this was written the other
--- way round.
+-- 所以把 handle 传回去，会让 `read` 在一个本该是数字的位置收到一张表。在真实
+-- CC:Tweaked 上这会抛错，调用方看到的就是一次下载失败——而这正是当初反着写时发生的
+-- 事情。
 function cli.fetch(url, on_progress)
   local api = http_api()
   if type(api) ~= "table" or type(api.get) ~= "function" then
     return nil, "E_HTTP_DISABLED", "HTTP is disabled on this computer"
   end
 
-  -- http.get DOES NOT RAISE when a request fails -- IT RETURNS THE FAILURE:
+  -- http.get 在请求失败时**不抛错**——它**返回失败**：
   --
-  --     handle                            on success
-  --     nil, message, failing_response    on failure
+  --     handle                            成功时
+  --     nil, message, failing_response    失败时
   --
-  -- and `pcall` carries every one of those through, so the message arrives in the
-  -- THIRD slot. Capturing only the second -- `local ok, response = pcall(...)` -- was
-  -- a real defect: the reason was thrown away and every failure was reported as
-  -- "the request failed", telling the user nothing. It also leaked the failing
-  -- response handle, which is a real handle that has to be closed.
+  -- 而 `pcall` 会把它们每一个都带上，所以 message 落在**第三个**槽位。只捕获第二个
+  -- ——`local ok, response = pcall(...)`——是一个真实的缺陷：原因被丢掉，每一次失败
+  -- 都报成 "the request failed"，等于什么都没告诉用户。它还会泄漏那个失败响应的
+  -- handle，而它是一个必须被关闭的真实 handle。
   --
-  -- MEASURED on CraftOS-PC 2.8.3. `table.pack` is used to read the shape, because a
-  -- table CONSTRUCTOR drops trailing nils and `#` is undefined across holes -- the
-  -- first attempt to measure this reported "1 value" and was wrong:
+  -- 在 CraftOS-PC 2.8.3 上**实测**。用 `table.pack` 读取形状，因为 table **构造器**
+  -- 会丢掉尾部的 nil，而 `#` 在有空洞时是未定义的——第一次测量因此报了 "1 value"，
+  -- 是错的：
   --
   --   success   pcall n=2  true, <response>
   --   404       pcall n=4  true, nil, "Not Found",                      <response>
@@ -958,14 +907,13 @@ function cli.fetch(url, on_progress)
   --   malformed pcall n=4  true, nil, "Must specify http or https",     nil
   local ok, response, message, failing = pcall(api.get, url)
   if not ok then
-    -- pcall only fails when http.get itself raised -- e.g. the Java side's "Too
-    -- many ongoing HTTP requests" -- which is a different thing from a refused
-    -- request, so it is reported as such.
+    -- pcall 只有在 http.get 自己抛错时才会失败——例如 Java 侧的 "Too many ongoing
+    -- HTTP requests"——这与「请求被拒绝」是两回事，所以分开上报。
     return nil, "E_HTTP", "the request raised: " .. tostring(response)
   end
   if response == nil then
-    -- A failing response is still a HANDLE (the 404 case returns one), so it is
-    -- closed here rather than leaked -- CC caps open files.
+    -- 失败的响应仍然是一个 **handle**（404 的情况下会返回一个），所以在这里关掉而不是
+    -- 泄漏——CC 对打开的文件数量有上限。
     if type(failing) == "table" and type(failing.close) == "function" then
       pcall(failing.close)
     end
@@ -1011,15 +959,14 @@ function cli.fetch(url, on_progress)
 end
 
 -- ---------------------------------------------------------------------------
--- Debug logging
+-- 调试日志
 -- ---------------------------------------------------------------------------
--- OFF unless --debug is given, and silent when it fails: a diagnostic that
--- crashes the program it is diagnosing is worse than no diagnostic. Writes with
--- file:write, where "\n" IS a newline -- unlike term.write, which stores it as an
--- ordinary character (see make_writer).
+-- 除非给了 --debug，否则**关闭**；失败时也保持沉默：一个把被诊断的程序搞崩的诊断，
+-- 比没有诊断更糟。写文件用 file:write，在那里 "\n" **就是**换行——不像 term.write，
+-- 后者把它当作普通字符存下来（见 make_writer）。
 cli.LOG_PATH = "nbsplay-debug.log"
 
--- cli.describe_argv(argv) -> a readable one-liner for the log.
+-- cli.describe_argv(argv) -> 一行可读的文本，写进日志。
 function cli.describe_argv(argv)
   if type(argv) ~= "table" then
     return "(" .. type(argv) .. ")"
@@ -1033,8 +980,7 @@ end
 
 -- make_logger(enabled, path) -> log, close
 --
--- Returns a no-op logger when disabled, so callers never branch on whether
--- logging is on.
+-- 关闭时返回一个空操作 logger，这样调用方永远不必为「日志是否开着」而分支。
 local function make_logger(enabled, path, term)
   if not enabled then
     local function noop() end
@@ -1050,11 +996,11 @@ local function make_logger(enabled, path, term)
   end
 
   local lines = {}
-  -- DOT-STYLE, NO SELF.  CC:Tweaked registers a handle's methods on Java methods
-  -- with no `self` parameter (AGENTS.md section 3), so `file.write(file, text)`
-  -- hands the handle over AS the text.  That is what made this logger create a log
-  -- file and then leave it at 0 bytes: the open succeeded (fs is an API table, so
-  -- fs.open(path, mode) is right) while every write quietly failed inside pcall.
+  -- 点号调用，不传 self。CC:Tweaked 把 handle 的方法注册在**没有** `self` 参数的 Java
+  -- 方法上（AGENTS.md 第 3 节），所以 `file.write(file, text)` 会把 handle 当作 text
+  -- 交出去。这正是这个 logger 曾经建了日志文件、却让它停在 0 字节的原因：打开成功了
+  -- （fs 是 API 表，所以 fs.open(path, mode) 是对的），而每一次写入都在 pcall 里默默
+  -- 失败。
   local write_failed = nil
 
   local function log(text)
@@ -1073,8 +1019,7 @@ local function make_logger(enabled, path, term)
     end
   end
 
-  -- A logger that cannot write is worth knowing about, so the caller can say so
-  -- instead of handing back an empty file.
+  -- 一个写不进去的 logger 值得被知道，好让调用方把它说出来，而不是交回一个空文件。
   local function why_empty()
     if file == nil then
       return "the log file could not be opened"
@@ -1098,12 +1043,11 @@ local function make_logger(enabled, path, term)
   return log, close, why_empty
 end
 
--- instrument_clock(clock, log) -> a clock that logs every call it receives.
+-- instrument_clock(clock, log) -> 一个会把收到的每次调用都记进日志的时钟。
 --
--- Forwards every call to the REAL clock, so nothing about the run changes -- only
--- the record does. This is the difference between measuring and modelling: a fake
--- clock would tell us what I assumed, and assumptions are what produced the last
--- four wrong diagnoses.
+-- 把每次调用都转发给**真实**时钟，所以这次运行什么都不变——变的只有记录。这就是
+-- 「测量」与「建模」的区别：一个假时钟只会告诉我们我假设了什么，而假设正是之前四次
+-- 误诊的来源。
 local function instrument_clock(clock, log)
   local wrapped = {}
   wrapped.errors = clock.errors
@@ -1143,28 +1087,26 @@ end
 
 -- cli.rate_verdict(real_ms, clock_ms) -> ok, code, detail
 --
--- PURE, so the thresholds are pinned by the spec rather than argued about.
+-- **纯函数**，所以阈值由规格钉住，而不是靠争论。
 --
---   real_ms    the known interval that elapsed -- an os.sleep duration
---   clock_ms   how far the injected clock's now_ms() moved during it
---   ratio      clock_ms / real_ms -- 1.0 is correct
+--   real_ms    流逝掉的已知区间——一个 os.sleep 的时长
+--   clock_ms   注入时钟的 now_ms() 在这段时间里前进了多少
+--   ratio      clock_ms / real_ms —— 1.0 才是对的
 --
--- A clock that does not advance with real time makes every delay wrong, and it
--- does so WITHOUT RAISING -- which is the worst possible failure for a scheduler.
--- Measured on a real machine, with the world's daylight cycle off:
+-- 一个不随真实时间前进的时钟会让每个延迟都错，而且是**不抛错**地错——对调度器来说这是
+-- 最糟的失败形态。在一台真实机器上、世界的昼夜循环关闭时实测：
 --
 --   CLOCK RATE: real=296ms clock_now_ms=0ms  ratio=0.000
---   clock.now_ms() -> 109436400     ... for the entire run
+--   clock.now_ms() -> 109436400     ... 整段运行都是这个值
 --
--- so `delay = ideal - now` stopped being an interval and became each event's own
--- absolute t_ms, compounding until a 143 s song never finished. The other direction
--- is just as broken: os.epoch("ingame") advances 72000 ms per real second when the
--- cycle IS on (a Minecraft day is 20 real minutes), so every event is instantly
--- overdue and the whole song dispatches at once.
+-- 于是 `delay = ideal - now` 不再是一个区间，而变成了每个事件自己的绝对 t_ms，不断累积，
+-- 直到一首 143 秒的歌永远播不完。反方向的坏法一样严重：昼夜循环**开着**时
+-- os.epoch("ingame") 每真实秒前进 72000 ms（一个 Minecraft 日是 20 真实分钟），于是每个
+-- 事件都瞬间逾期，整首歌一次性全部派发出去。
 --
---   real_ms    the known interval that elapsed (an os.sleep duration)
---   clock_ms   how far the injected clock's now_ms() moved during that time
---   ratio      clock_ms / real_ms -- 1.0 is correct
+--   real_ms    流逝掉的已知区间（一个 os.sleep 的时长）
+--   clock_ms   注入时钟的 now_ms() 在那段时间里前进了多少
+--   ratio      clock_ms / real_ms —— 1.0 才是对的
 function cli.rate_verdict(real_ms, clock_ms)
   if type(real_ms) ~= "number" or type(clock_ms) ~= "number"
     or real_ms ~= real_ms or clock_ms ~= clock_ms or real_ms <= 0 then
@@ -1197,9 +1139,9 @@ end
 
 -- check_clock_health(clock, log) -> ok, code, detail
 --
--- Runs the probe and applies the verdict. Skipped where real time cannot be read
--- (no os.epoch / no os.sleep -- plain desktop Lua, which is what the suite runs
--- under), because a check that cannot measure anything must not block a run.
+-- 跑一次探测并套用判定。读不到真实时间时跳过（没有 os.epoch / 没有 os.sleep——桌面版
+-- 普通 Lua 就是这种情况，测试套件正是在它之下运行的），因为一个什么都测不了的检查
+-- 不该拦住一次运行。
 local function check_clock_health(clock, log)
   local os_api = raw_global("os")
   if type(os_api) ~= "table"
@@ -1210,17 +1152,16 @@ local function check_clock_health(clock, log)
     return true, nil, nil
   end
 
-    -- THE REFERENCE IS os.sleep, NOT A SECOND READING OF THE CLOCK.
+    -- 参照物是 os.sleep，而不是再读一次时钟。
     --
-    -- The first version of this check read os.epoch("utc") before and after the
-    -- sleep and compared it against clock.now_ms() -- but now_ms IS os.epoch("utc"),
-    -- so it compared the clock with ITSELF and could only ever report 1.0. A check
-    -- that cannot fail is worse than no check, because it looks like one.
+    -- 这个检查的第一个版本是在 sleep 前后各读一次 os.epoch("utc")，拿去和
+    -- clock.now_ms() 比较——但 now_ms **就是** os.epoch("utc")，所以它是在拿时钟和
+    -- **它自己**比，永远只能报出 1.0。一个不可能失败的检查比没有检查更糟，因为它
+    -- 看起来像一个检查。
     --
-    -- os.sleep blocks for a known stretch of real time on the game's own timer,
-    -- which is a reference INDEPENDENT of where now_ms comes from. If the clock is
-    -- healthy it advances by about that much; if it is frozen it does not move; if
-    -- its unit is wrong it moves by the wrong factor.
+    -- os.sleep 借游戏自己的计时器阻塞一段已知的真实时间，这是一个与 now_ms 从哪来
+    -- **无关**的参照物。时钟健康时它会前进差不多这么多；冻结时它纹丝不动；单位错了时
+    -- 它会按错误倍数前进。
     local SLEEP_MS = 200
 
     local ok, clock_ms = pcall(function()
@@ -1234,8 +1175,8 @@ local function check_clock_health(clock, log)
       return true, nil, nil
     end
 
-    -- rate_verdict(real_ms, clock_ms): how far the clock moved, against how far it
-    -- SHOULD have moved over that known interval.
+    -- rate_verdict(real_ms, clock_ms)：时钟实际走了多远，对照它在那段已知区间里
+    -- **本该**走多远。
     local healthy, code, detail = cli.rate_verdict(SLEEP_MS, clock_ms)
     log(string.format("clock check: slept %dms, now_ms advanced %sms -> %s",
       SLEEP_MS, tostring(clock_ms), healthy and "OK" or tostring(code)))
@@ -1246,22 +1187,21 @@ local function check_clock_health(clock, log)
   end
 
 -- ---------------------------------------------------------------------------
--- run(argv, opts) -> exit code
+-- run(argv, opts) -> 退出码
 -- ---------------------------------------------------------------------------
 
 function cli.run(argv, opts)
   opts = type(opts) == "table" and opts or {}
 
-  -- FORWARD DECLARED, not declared here: `say` and `fail` are defined below and
-  -- reference this, and Lua resolves a name lexically at COMPILE time. A `local`
-  -- introduced after them would leave those references looking up a GLOBAL, which
-  -- is nil, and every message would raise instead of printing.
+  -- 前向声明，不在这里声明：`say` 和 `fail` 定义在下面并引用它，而 Lua 在**编译期**
+  -- 按词法解析名字。声明在它们之后的 `local` 会让那些引用变成全局查找，结果是 nil，
+  -- 于是每条消息都会抛错而不是打印出来。
   local log, close_log, log_empty
 
   local out = make_writer()
   if type(opts.write) == "function" then
-    -- A single injected sink receives BOTH kinds, so a test sees exactly the
-    -- ordered sequence the terminal would: refreshes included.
+    -- 一个被注入的接收器同时接收**两种**输出，这样测试看到的正是终端会看到的那个有序
+    -- 序列：刷新也在内。
     out = {
       line = opts.write,
       refresh = opts.write,
@@ -1272,14 +1212,12 @@ function cli.run(argv, opts)
   local lib = library()
   local rt = runtime_module()
 
-  -- Every permanent line is `nbsplay: ...`, so the output is greppable and has one
-  -- shape; every failure is `nbsplay: E_CODE: detail`, so it is machine-readable
-  -- as well as readable.  The same rule the library follows when it hands over
-  -- `{code = "E_..."}` rather than a sentence.
-  -- Every permanent line goes through `wrapped`, so nothing this program prints can be
-  -- clipped by a terminal narrower than the message. The out-of-range menu is the
-  -- reason: its lines are 77 to 80 characters and the default terminal is 51 columns,
-  -- which is how a user ended up reading "…-- play a different RECO".
+  -- 每条永久行都是 `nbsplay: ...`，所以输出可 grep、且只有一种形状；每次失败都是
+  -- `nbsplay: E_CODE: detail`，所以它既可读、又机器可读。这与库交出 `{code = "E_..."}`
+  -- 而不是一句句子时遵循的是同一条规则。
+  -- 每条永久行都经过 `wrapped`，所以本程序打印的任何内容都不会被比消息更窄的终端裁掉。
+  -- 越界菜单就是原因：它的行是 77 到 80 个字符，而默认终端是 51 列，用户因此读到了
+  -- "…-- play a different RECO"。
   local function say(text)
     out.wrapped("nbsplay: " .. tostring(text or ""))
     log("say: " .. tostring(text or ""))
@@ -1300,7 +1238,7 @@ function cli.run(argv, opts)
   end
   if url == nil then
     fail("E_USAGE", parse_error)
-    -- Help text: left unprefixed, because prefixing every line of it is noise.
+    -- 帮助文本：不加前缀，因为给它每一行都加前缀只是噪音。
     local first, second, third, fourth = cli.usage()
     out.line(first)
     if second then out.line(second) end
@@ -1322,8 +1260,7 @@ function cli.run(argv, opts)
           math.floor(received / 1024), math.floor(total / 1024))
         live(cli.progress_line("download", received / total, { kib }))
       else
-        -- No Content-Length, so there is no fraction to draw -- report the count
-        -- rather than inventing one.
+        -- 没有 Content-Length，就没有比例可画——报告计数，而不是凭空编一个比例。
         live(string.format("download  %d KiB", math.floor(received / 1024)))
       end
     end)
@@ -1337,18 +1274,17 @@ function cli.run(argv, opts)
   if type(decoded) ~= "table" or decoded.ok ~= true then
     local code = type(decoded) == "table" and decoded.error
       and decoded.error.code or "unknown"
-    -- The library's OWN typed code is passed through, not restated: it is
-    -- the machine-readable half of the contract, so a script can branch on it.
+    -- 库**自己的**带类型码被原样透传，而不是重述一遍：它是契约里机器可读的那一半，
+    -- 好让脚本按它分支。
     fail("E_DECODE", code)
     return 1
   end
 
   local song = decoded.song
 
-  -- WHICH NOTES ARE OUT OF RANGE, asked with PASSTHROUGH because that policy changes
-  -- no event's kind: every audible note stays a play_note, so the count is the number
-  -- of notes that would actually sound and the answer is independent of what the user
-  -- is about to choose.
+  -- 哪些音符越界，用 PASSTHROUGH 来问，因为这个策略不改变任何事件的 kind：每个可听
+  -- 音符都仍是 play_note，所以计数就是真正会发声的音符数，答案与用户即将做出的选择
+  -- 无关。
   local probe = lib.analyze(song,
     { out_of_range = "passthrough" })
   local has_out_of_range = probe.has_extended_range == true
@@ -1356,8 +1292,8 @@ function cli.run(argv, opts)
   local out_of_range = "passthrough"
   if has_out_of_range then
     if policy ~= nil then
-      -- An unattended caller named a policy, so the menu is skipped -- but it is still
-      -- SAID, so the log and the screen agree about how the song was played.
+      -- 一个无人值守的调用方点名了策略，于是菜单被跳过——但它仍会被**说出**，这样日志
+      -- 和屏幕对「这首歌是怎么播的」保持一致。
       out_of_range = policy
       say("out-of-range notes: " .. policy)
     else
@@ -1366,9 +1302,8 @@ function cli.run(argv, opts)
     end
   end
 
-  -- The POLICY is settled BEFORE planning, because it decides an event's kind and
-  -- therefore the speaker requirement -- choosing afterwards would size the fan-out
-  -- for the wrong cost.
+  -- 策略在编排**之前**就定下来，因为它决定事件的 kind、进而决定扬声器需求——之后再选
+  -- 就会按错误的成本去规划扇出。
   local analysis = lib.analyze(song, { out_of_range = out_of_range })
   local events = lib.plan(song, analysis, { out_of_range = out_of_range })
   local duration = cli.duration_ms(events)
@@ -1383,7 +1318,7 @@ function cli.run(argv, opts)
       tostring(header.song_length), tostring(#(song.notes or {})), tostring(#events)))
     log(string.format("duration from the PLAN: %d ms (%s)",
       duration, cli.format_time(duration)))
-    -- Distinct deadlines: the number of timers a per-deadline scheduler needs.
+    -- 不重复的到期时刻：按时限调度的调度器所需的定时器数量。
     local seen, distinct = {}, 0
     for index = 1, #events do
       local key = events[index].t_ms
@@ -1405,9 +1340,8 @@ function cli.run(argv, opts)
     end
   end
 
-  -- A title if the file has one, so a user can tell whether they got the song
-  -- they meant to.  CP1252 bytes are converted for DISPLAY only, which is what
-  -- the library's converter is for; the song itself keeps its bytes.
+  -- 文件里若有标题就显示出来，这样用户能确认拿到的是自己想听的那首歌。CP1252 字节
+  -- **只为显示**而转换，这正是库那个转换器的用途；歌曲本身保留自己的字节。
   local title = type(song.header) == "table" and song.header.name or nil
   if type(title) == "string" and title ~= "" and lib.cp1252 ~= nil
     and type(lib.cp1252.to_display) == "function" then
@@ -1423,10 +1357,9 @@ function cli.run(argv, opts)
   local speakers = lib.discover_speakers()
   local found = type(speakers) == "table" and #speakers or 0
 
-  -- BOTH NUMBERS.  Reporting only how many are attached answers half the question:
-  -- a user cannot tell whether two speakers are two enough.  The requirement is the
-  -- library's figure and follows the policy just chosen, so it has to be read AFTER
-  -- that choice -- which it is.
+  -- **两个数字都要给。** 只报告接了多少个只回答了一半问题：用户无法判断两个扬声器够
+  -- 不够。需求数字来自库，且跟随刚选定的策略，所以必须在那次选择**之后**读取——这里
+  -- 正是如此。
   local needed = 0
   if lib.speaker_requirement ~= nil then
     needed = lib.speaker_requirement(analysis) or 0
@@ -1450,21 +1383,18 @@ function cli.run(argv, opts)
     return 1
   end
 
-  -- REFUSE A SONG THE SPEAKERS CANNOT HOLD, BEFORE ANY EXPENSIVE WORK.
+  -- 在任何昂贵工作之前，先拒绝一首扬声器装不下的歌。
   --
-  -- Measured on `RushE.nbs` under the default shift policy: a peak of 109 simultaneous
-  -- play_sounds, so 117 speakers are needed where 43 are attached. The allocator spent
-  -- ELEVEN SECONDS relocating notes to make room for sounds it could never place --
-  -- 43 speakers cannot hold 109 concurrent sounds however the notes are shuffled -- and
-  -- on a real computer that is past the watchdog, so it crashed instead of finishing.
+  -- 在默认 shift 策略下于 `RushE.nbs` 实测：同时 109 个 play_sound 的峰值，于是在只
+  -- 接了 43 个扬声器的地方需要 117 个。分配器花了**十一秒**去挪动音符、为它永远放不下
+  -- 的声音腾位置——无论怎么重排音符，43 个扬声器都装不下 109 个并发声音——而在真实电脑
+  -- 上这已经超过看门狗时限，于是它不是播完、而是崩了。
   --
-  -- The shortfall is already known here, so refusing costs nothing and the futile work
-  -- never starts. `--force` plays anyway: losing notes is the user's call once they can
-  -- see the numbers.
+  -- 缺口在这里就已经知道，所以拒绝不要任何成本，白费的工作根本不会开始。`--force` 照样
+  -- 播放：一旦用户看见了数字，丢音符就是他们的决定。
   --
-  -- A MISSING NUMBER IS NOT A SHORTFALL. An older or partial library exposes no
-  -- `speaker_requirement`, and treating "unknown" as "needs a great many" would refuse
-  -- every song. Only a definite shortfall blocks.
+  -- **数字缺失不等于有缺口。** 一个更旧或残缺的库不暴露 `speaker_requirement`，而把
+  -- 「未知」当作「需要非常多」会拒绝掉每一首歌。只有确定的缺口才拦。
   if needed > found and not force then
     fail("E_NOT_ENOUGH_SPEAKERS", string.format(
       "this needs %d speakers but %d are attached", needed, found))
@@ -1480,18 +1410,15 @@ function cli.run(argv, opts)
   end
 
   if needed > found then
-    -- Forcing is a deliberate choice, so it is stated: the user should not have to
-    -- remember that they asked to lose notes.
+    -- 强制播放是一个刻意的选择，所以要说出来：用户不该被迫记住自己要求过丢掉音符。
     say(string.format(
       "forced: needs %d speakers, %d attached -- notes that do not fit will be dropped",
       needed, found))
   end
 
-  -- A shortfall is NOT reported again here: the library already emits its `speakers`
-  -- warning with the numbers (required, found, dropped), and saying it twice in
-  -- different words is how a message becomes noise. The summary line above carries the
-  -- count, and playback continues -- losing notes is the user's call, not a reason to
-  -- refuse a song they asked to hear.
+  -- 缺口**不**在这里再报一遍：库已经带着数字（required、found、dropped）发出了它的
+  -- `speakers` 警告，而换一套说法把同一件事说两遍，正是一条消息变成噪音的方式。上面的
+  -- 摘要行已经带了计数，播放继续——丢音符是用户的决定，不是拒绝一首他们想听的歌的理由。
 
   local clock = current_clock()
   if clock == nil then
@@ -1499,16 +1426,14 @@ function cli.run(argv, opts)
     return 1
   end
   if type(clock.run_due) ~= "function" then
-    -- Refused rather than degraded: polling cannot drive this clock, so
-    -- accepting it here would mean accepting a silent song.
+    -- 拒绝而不是降级：轮询驱动不了这个时钟，所以在这里接受它，等于接受一首无声的歌。
     fail("E_NO_CLOCK", "this clock cannot be driven (no run_due)")
     return 1
   end
 
-  -- THE CLOCK IS CHECKED ON EVERY RUN, not just under --debug, and a clock that
-  -- does not track real time REFUSES the song. Playing it anyway produces a
-  -- silently wrong result -- either a song that never ends or one that finishes in
-  -- seconds -- and no amount of watching the progress bar would explain why.
+  -- **每次运行都检查时钟**，不只是 --debug 时；一个不跟随真实时间的时钟会**拒绝**这
+  -- 首歌。照播会得到一个静默错误的结果——要么一首永远播不完的歌，要么一首几秒就结束
+  -- 的歌——而且再怎么盯着进度条也解释不了原因。
   log("--- clock: measuring rate before playback (0.2 s pause) ---")
   local clock_ok, clock_code, clock_detail = check_clock_health(clock, log)
   if not clock_ok then
@@ -1528,9 +1453,8 @@ function cli.run(argv, opts)
     speakers = speakers,
     clock = clock,
     out_of_range = out_of_range,
-    -- WARNINGS WERE BEING DISCARDED.  The library emits bare codes and expects the
-    -- caller to word them; a CLI that passes no handler silently loses every one, so
-    -- "no warning appeared" said nothing about whether there had been a problem.
+    -- 警告曾被**丢弃**。库发出裸码、并期待调用方为它措辞；一个不传任何处理器的 CLI
+    -- 会静默丢掉每一条，于是「没有警告出现」对「之前有没有出过问题」什么也说明不了。
     on_warning = function(code, args)
       log(string.format("WARN %s", tostring(code)))
       say("warning: " .. cli.describe_warning(code, args))
@@ -1538,14 +1462,13 @@ function cli.run(argv, opts)
     on_progress = function(info)
       local elapsed = tonumber(info.t_ms) or 0
       local frac = duration > 0 and (elapsed / duration) or 0
-      -- Most informative first: the clock, then the note counter. The one that
-      -- does not fit is the one that goes.
+      -- 信息量最大的在前：先是时钟，然后是音符计数。装不下的那个才被丢掉。
       live(cli.progress_line("playing", frac, {
         "  " .. cli.format_time(elapsed) .. "/" .. cli.format_time(duration),
         string.format("  note %d/%d",
           tonumber(info.index) or 0, tonumber(info.total) or 0),
       }))
-      -- Rate-limited: 21247 callbacks would bury the log.
+      -- 限流：21247 次回调会把日志淹掉。
       progress_logged = progress_logged + 1
       if progress_logged <= 10 or progress_logged % 200 == 0 then
         log(string.format("progress %d/%s  t_ms=%s (%s)",
@@ -1560,13 +1483,12 @@ function cli.run(argv, opts)
     return 1
   end
 
-  -- DRIVE THE SONG. run_due() blocks on os.pullEvent("timer") and dispatches
-  -- each armed handle until none remains -- which is the whole song. The
-  -- progress callback fires from inside that dispatch, so the bar still moves.
+  -- 驱动这首歌。run_due() 阻塞在 os.pullEvent("timer") 上，并派发每个装上的 handle，
+  -- 直到一个都不剩——也就是整首歌。进度回调就从那次派发内部触发，所以进度条仍在动。
   clock.run_due()
 
-  -- A timer callback that raised was CAPTURED, not propagated, so without this
-  -- a broken dispatch would look exactly like a song that finished.
+  -- 抛错过的定时器回调是被**捕获**的，不是被传播的，所以没有这一步，一次坏掉的派发会
+  -- 看起来和一首播完的歌一模一样。
   if type(clock.errors) == "table" and #clock.errors > 0 then
     local first = clock.errors[1]
     local message = type(first) == "table" and first.message or tostring(first)
@@ -1578,8 +1500,7 @@ function cli.run(argv, opts)
     return 1
   end
 
-  -- If it still reports itself playing once the clock has drained, something
-  -- stopped early. Saying "done." there would be a lie.
+  -- 如果时钟都排干了它仍报告自己在播放，说明有什么提前停了。此时说 "done." 会是撒谎。
   if type(session.is_playing) == "function" and session.is_playing() then
     fail("E_DISPATCH", "playback did not finish; the clock stopped early")
     if rt ~= nil and type(rt.cleanup) == "function" then
@@ -1589,8 +1510,8 @@ function cli.run(argv, opts)
     return 1
   end
 
-  -- Speakers are stopped on EVERY path, including this one, because a speaker
-  -- left playing keeps sounding after the program ends.
+  -- **每一条**路径上都要停掉扬声器，包括这一条，因为一个还在播放的扬声器会在程序结束后
+  -- 继续响。
   if rt ~= nil and type(rt.cleanup) == "function" then
     pcall(rt.cleanup, speakers, session)
   end
@@ -1607,7 +1528,7 @@ function cli.run(argv, opts)
 end
 
 -- ---------------------------------------------------------------------------
--- Autorun -- only when executed as a program, never when required by a test
+-- Autorun —— 只在作为程序执行时触发，被测试 require 时永不触发
 -- ---------------------------------------------------------------------------
 do
   local first = (...)

@@ -1,39 +1,34 @@
 -- nbs/cp1252.lua
 --
--- CP1252 (Windows-1252) -> UTF-8 display mapping for CCNBSLib.
+-- CCNBSLib 的 CP1252（Windows-1252）→ UTF-8 显示映射。
 --
--- WHY THIS MODULE EXISTS
---   NBS v0-v5 store every string as one byte per character in CP1252, NOT
---   UTF-8.  The reader (nbs/reader.lua) reads those bytes byte-exact and the
---   model keeps them byte-exact: custom-instrument sound-file paths are stored
---   as raw bytes and depend on that fidelity.  But when a song or layer name is
---   SHOWN to a human, those CP1252 bytes must be rendered as UTF-8 so the
---   terminal prints real typographic characters instead of mojibake.
+-- 这个模块为什么存在
+--   NBS v0-v5 把每个字符串按**一字节一字符**存成 CP1252，**不是** UTF-8。读取器
+--   （nbs/reader.lua）逐字节原样读出，模型也逐字节原样保存：自定义乐器的音效文件路径
+--   就是按原始字节存的，依赖这份保真度。但当曲名或图层名要**给人看**时，这些 CP1252
+--   字节必须渲染成 UTF-8，终端才会打出真正的印刷字符、而不是乱码。
 --
---   This module is the SINGLE place where that conversion is allowed to happen.
---   to_display() is a PURE DISPLAY TRANSFORM: it never mutates its input and
---   must never be applied to a stored field or to a sound-file path.
+--   本模块是**唯一**允许做这个转换的地方。to_display() 是一个**纯显示变换**：它从不
+--   修改输入，也**绝不**能用在存储字段或音效文件路径上。
 --
--- TARGET INTERPRETER
---   Stock Lua 5.2.4 (the project's local Tier-1 interpreter).  Lua 5.2 has NO
---   utf8 library (that arrived in 5.3), so UTF-8 byte sequences are emitted by
---   hand with string.char().  No utf8.* call appears anywhere in this file.
+-- 目标解释器
+--   原版 Lua 5.2.4（项目本地的 Tier-1 解释器）。Lua 5.2 **没有** utf8 库（5.3 才有），
+--   所以 UTF-8 字节序列是用 string.char() 手工拼的。本文件里不出现任何 utf8.* 调用。
 --
--- ENCODING RULES
---   * 0x00-0x7F -> identity (ASCII is the same byte in CP1252 and UTF-8).
---   * 0xA0-0xFF -> identity code point (CP1252 agrees with Latin-1 there);
---                  each becomes a 2-byte UTF-8 sequence U+00A0..U+00FF.
---   * 0x80-0x9F -> CP1252-specific table (these DIFFER from Latin-1).
---   * The five undefined CP1252 bytes 0x81 0x8D 0x8F 0x90 0x9D -> U+FFFD
---     REPLACEMENT CHARACTER.
+-- 编码规则
+--   * 0x00-0x7F -> 原样（ASCII 在 CP1252 与 UTF-8 里是同一个字节）。
+--   * 0xA0-0xFF -> 码点相同（这一段 CP1252 与 Latin-1 一致）；
+--                  各变成一个 2 字节的 UTF-8 序列 U+00A0..U+00FF。
+--   * 0x80-0x9F -> CP1252 **专有**表（这一段与 Latin-1 **不同**）。
+--   * CP1252 未定义的五个字节 0x81 0x8D 0x8F 0x90 0x9D -> U+FFFD **替换字符**。
 
 local cp1252 = {}
 
--- U+FFFD REPLACEMENT CHARACTER, used for the five undefined CP1252 bytes.
+-- U+FFFD 替换字符，用于 CP1252 未定义的那五个字节。
 local REPLACEMENT = 0xFFFD
 
--- Authoritative CP1252 mapping for 0x80..0x9F, in byte order (index 1 == 0x80).
--- Undefined slots hold REPLACEMENT.
+-- 0x80..0x9F 的权威 CP1252 映射，按字节顺序（下标 1 == 0x80）。
+-- 未定义的槽位放 REPLACEMENT。
 local CP1252_80_9F = {
   0x20AC, REPLACEMENT, 0x201A, 0x0192,  -- 0x80 0x81 0x82 0x83
   0x201E, 0x2026,     0x2020, 0x2021,  -- 0x84 0x85 0x86 0x87
@@ -45,11 +40,11 @@ local CP1252_80_9F = {
   0x0153, REPLACEMENT, 0x017E, 0x0178, -- 0x9C 0x9D 0x9E 0x9F
 }
 
--- Byte-indexed code-point table: CODE_POINT[byte] -> Unicode code point.
+-- 按字节索引的码点表：CODE_POINT[byte] -> Unicode 码点。
 local CODE_POINT = {}
 
 for byte = 0x00, 0x7F do
-  CODE_POINT[byte] = byte -- ASCII: identical in CP1252 and UTF-8.
+  CODE_POINT[byte] = byte -- ASCII：CP1252 与 UTF-8 完全相同。
 end
 
 for offset = 0, 0x1F do
@@ -57,10 +52,10 @@ for offset = 0, 0x1F do
 end
 
 for byte = 0xA0, 0xFF do
-  CODE_POINT[byte] = byte -- CP1252 agrees with Latin-1 above 0x9F.
+  CODE_POINT[byte] = byte -- 0x9F 以上 CP1252 与 Latin-1 一致。
 end
 
--- Encode a Unicode code point as its UTF-8 byte sequence, without utf8.*.
+-- 把一个 Unicode 码点编码成它的 UTF-8 字节序列，不用 utf8.*。
 local function encode(code_point)
   if code_point < 0x80 then
     return string.char(code_point)
@@ -82,12 +77,11 @@ local function encode(code_point)
   end
 end
 
--- byte_to_utf8(byte) -> UTF-8 string for a single CP1252 byte value 0..255.
+-- byte_to_utf8(byte) -> 单个 CP1252 字节值 0..255 对应的 UTF-8 字符串。
 --
--- PUBLIC HELPER, NOT DEAD CODE.  to_display() below is the production caller
--- (it encodes each stored byte through this), and the function is exported so
--- a caller that needs only one byte -- e.g. a single-character preview -- can
--- use it directly.  The test suite pins its output byte-for-byte.
+-- **公共辅助函数，不是死代码。** 下面的 to_display() 就是生产调用方（它把每个存储
+-- 字节都过一遍这里），而这个函数被导出，是为了让只需要一个字节的调用方——例如单字符
+-- 预览——可以直接用它。测试逐字节钉住了它的输出。
 function cp1252.byte_to_utf8(byte)
   if type(byte) ~= "number" then
     error("cp1252.byte_to_utf8: expected a number, got " .. type(byte), 2)
@@ -99,8 +93,8 @@ function cp1252.byte_to_utf8(byte)
   return encode(CODE_POINT[byte])
 end
 
--- to_display(bytes) -> UTF-8 string suitable for printing.
--- Pure transform: the input string is left byte-exact and unmodified.
+-- to_display(bytes) -> 适合打印的 UTF-8 字符串。
+-- 纯变换：输入字符串保持逐字节原样、不被修改。
 function cp1252.to_display(bytes)
   if type(bytes) ~= "string" then
     error("cp1252.to_display: expected a string, got " .. type(bytes), 2)

@@ -1,100 +1,84 @@
 -- player/tempo.lua
 --
--- THE DRIFT-CORRECTED TEMPO SCHEDULER.
+-- 抗漂移的 tempo 调度器。
 --
 -- ---------------------------------------------------------------------------
--- WHY THIS MODULE EXISTS
+-- 为什么存在这个模块
 -- ---------------------------------------------------------------------------
--- CC:Tweaked's timer primitive (os.startTimer -- used by the CC:T clock
--- adapter) rounds a requested delay UP to the next 0.05 s world tick.  A tempo
--- whose tick duration is NOT a multiple of 50 ms -- e.g. 15 ticks/second, i.e.
--- 66.667 ms per tick -- therefore CANNOT be represented exactly.  If a
--- scheduler repeatedly requested after(tick_ms) it would accumulate the
--- ~16.667 ms overshoot on every tick and the song would drift progressively
--- late: after 500 ticks the last event lands roughly 500 * 16.667 = 8.3 s past
--- where it belongs.
+-- CC:Tweaked 的 timer 原语（os.startTimer——被 CC:T 时钟适配器使用）会把请求的
+-- delay **向上**取整到下一个 0.05 s 的世界 tick。所以一条 tick 时长并非 50 ms 整数
+-- 倍的 tempo——例如每秒 15 tick，即每 tick 66.667 ms——**无法**被精确表示。如果一个
+-- 调度器反复请求 after(tick_ms)，它会在每个 tick 上累积约 16.667 ms 的超调，歌曲会
+-- 逐渐拖后：500 tick 之后，最后一个事件落在它应在位置之后约 500 * 16.667 = 8.3 s。
 --
--- THE CUMULATIVE-IDEAL-TIMELINE RULE
+-- 累计理想时间线规则
 -- ---------------------------------------------------------------------------
--- The scheduler never adds tick_ms to the previous delay.  Instead:
+-- 调度器从不把 tick_ms 加到上一个 delay 上。取而代之：
 --
---   * An ANCHOR (start_ms = the clock reading when play() began) and a
---     MONOTONICALLY INCREASING index into the time-sorted event array are kept.
---   * For the next due event, ideal = start_ms + event.t_ms on the IDEAL
---     timeline, and the requested delay is (ideal - clock.now_ms()) / 1000.
---   * After the clock fires, the NEXT delay is recomputed from the ideal
---     timeline again -- never from the actual firing time.
+--   * 保留一个**锚点**（start_ms = play() 开始时的时钟读数）和进入按时间排序的事件
+--     数组的一个**单调递增**索引。
+--   * 对下一个到期事件，ideal = start_ms + event.t_ms 是**理想**时间线上的时刻，
+--     而请求的 delay 是 (ideal - clock.now_ms()) / 1000。
+--   * 时钟触发之后，下一个 delay 再次从理想时间线重新计算——从不从实际的触发时刻算。
 --
--- A delay that was rounded UP is therefore compensated by a shorter next
--- request, so drift stays BOUNDED (about one rounding step) instead of growing
--- without limit.  This is the entire point of the module.
+-- 因此一个被向上取整的 delay 会被一个更短的下一次请求补偿，于是漂移保持**有界**
+-- （约一个取整步长），而不是无限制增长。这就是本模块的全部意义。
 --
--- TEMPO REPRESENTABILITY AND THE CLAMP WARNING
+-- TEMPO 可表示性与 CLAMP 警告
 -- ---------------------------------------------------------------------------
--- "Clamped" describes a REAL timing limitation: the song's NOMINAL tick
--- interval -- opts.tick_ms, i.e. 1000 / analysis.ticks_per_second -- is itself
--- shorter than MIN_TIMER_MS (0.05 s), so the injected clock cannot represent
--- the requested tempo and rounds every delay UP to the next world tick.  Only
--- then are events counted in stats.clamped_ticks (one per event scheduled
--- while the run is clamp-active) and reported ONCE per run via the optional
--- warn callback with the bare code CLAMP_WARN_CODE.  A sub-granularity event
--- is still scheduled, never rounded away or skipped; on a virtual clock the
--- delay is exact, on the real CC:T clock the primitive rounds it up.
+-- "Clamped" 描述的是一种**真实**的时序限制：歌曲的**标称** tick 间隔——
+-- opts.tick_ms，即 1000 / analysis.ticks_per_second——本身就短于 MIN_TIMER_MS
+-- （0.05 s），所以注入的时钟无法表示所请求的 tempo，会把每个 delay **向上**取整到
+-- 下一个世界 tick。只有这时，事件才会被计入 stats.clamped_ticks（在运行处于
+-- clamp 激活期间每调度一个事件计一次），并通过可选的 warn 回调以裸码
+-- CLAMP_WARN_CODE 每次运行**至多报告一次**。亚粒度事件仍然会被调度，绝不丢弃或跳过；
+-- 在虚拟时钟上 delay 是精确的，在真实 CC:T 时钟上原语会把它向上取整。
 --
--- A delay of zero or less is NOT a clamp: it means "this event is DUE NOW".
--- The first note of virtually every song sits at t_ms = 0, and every
--- simultaneous note of a chord shares its tick's deadline, so treating those
--- as clamped made the warning fire on almost every song and devalued it.
--- Such events are scheduled immediately and are neither counted nor warned
--- about -- that was the spurious-warning defect (B2).
+-- 零或负的 delay **不是** clamp：它意味着“这个事件现在就该到点”。几乎每首歌的第一个
+-- 音符都位于 t_ms = 0，而一个和弦里同时发声的每个音符都共享其 tick 的截止时间，所以
+-- 把这些当作 clamped 会让警告在几乎每首歌上触发，从而贬值。这类事件立即被调度，既不
+-- 计数也不报警——那正是虚假警告缺陷（B2）。
 --
--- opts.tick_ms is the AUTHORITATIVE nominal interval.  When a caller omits it
--- the scheduler derives the SMALLEST POSITIVE GAP between distinct event
--- times; distinct ticks are whole multiples of the nominal interval apart, so
--- that gap can never UNDER-estimate the interval and a genuinely
--- sub-granularity song still warns.
+-- opts.tick_ms 是**权威的**标称间隔。当调用方省略它时，调度器推导不同事件时间之间
+-- **最小的正间隔**；不同的 tick 都是标称间隔的整数倍，所以那个间隔**不可能低估**真实
+-- 间隔，一首真正亚粒度的歌依然会报警。
 --
--- The nominal interval is assumed validated UPSTREAM: nbs/header.lua rejects
--- a non-positive stored tempo as E_BAD_TEMPO, so nbs.decode never yields a
--- song whose analysis has a non-finite tick_ms.  DEFENCE IN DEPTH applies
--- here anyway: tempo.new refuses a non-finite or non-positive opts.tick_ms
--- outright, and the scheduler refuses to hand the clock a non-finite delay.
--- A corrupt tempo must fail LOUDLY and IMMEDIATELY rather than silently
--- scheduling a callback that can never fire; a NaN deadline must never enter
--- the clock.  A tempo of 0 is corrupt input, not a slow song: it is NEVER
--- clamped into something playable.
+-- 标称间隔被假定已在**上游**校验过：nbs/header.lua 会把非正的存储 tempo 拒绝为
+-- E_BAD_TEMPO，所以 nbs.decode 永远不会产出一首其分析带有非有限 tick_ms 的歌。这里
+-- 仍然做**纵深防御**：tempo.new 直接拒绝非有限或非正的 opts.tick_ms，调度器也拒绝把
+-- 非有限的 delay 交给时钟。损坏的 tempo 必须**立即且大声**地失败，而不是去静默调度
+-- 一个永远无法触发的回调；NaN 截止时间绝不能进入时钟。tempo 为 0 是损坏的输入，不是
+-- 一首慢歌：它**从不**被 clamp 成某种能播的东西。
 --
--- THE CLOCK SEAM AND ITS CALLING CONVENTION (VERIFIED TRAP)
+-- 时钟接缝及其调用约定（已实测的陷阱）
 -- ---------------------------------------------------------------------------
--- The clock is INJECTED through opts.clock; there is NO default.  Refusing to
--- silently grab the real clock is deliberate: it keeps this module testable and
--- every test honest.  This module never calls os.startTimer / os.sleep /
--- os.epoch / os.pullEvent itself -- the injected clock is the ONLY time source.
+-- 时钟通过 opts.clock **注入**；**没有**默认值。拒绝静默抓取真实时钟是刻意的：它让
+-- 本模块可测、让每个测试诚实。本模块自己从不调用 os.startTimer / os.sleep /
+-- os.epoch / os.pullEvent——注入的时钟是**唯一**的时间来源。
 --
--- player/clock.lua's methods are DOT-style and take NO explicit self:
---     clock.after(vc, 0.1, fn)  or  vc.after(0.1, fn)   -- correct
---     vc:after(0.1, fn)                                  -- WRONG
--- Calling a clock method with a colon passes the clock as `delay_sec` and
--- fails.  This is the OPPOSITE of player/speaker.lua, whose methods DO take
--- self and are called with a colon -- the two seams do NOT share a convention.
--- By contrast this module's OWN frozen interface IS colon-style (t:play,
--- t:cancel, t:stats).  Do not let the clock's dot-style trip you up.
+-- player/clock.lua 的方法是**点号风格**，且**不**接受显式 self：
+--     clock.after(vc, 0.1, fn)  或  vc.after(0.1, fn)   -- 正确
+--     vc:after(0.1, fn)                                  -- 错误
+-- 用冒号调用时钟方法会把时钟本身当作 `delay_sec` 传入，从而失败。这与
+-- player/speaker.lua **相反**，后者的方法**确实**接受 self 并用冒号调用——两个接缝
+-- **不**共享同一约定。相比之下，本模块**自己**的冻结接口**是**冒号风格（t:play、
+-- t:cancel、t:stats）。别让时钟的点号风格把你绊倒。
 --
--- Compatibility: Lua 5.2 / CC:Tweaked Cobalt.  No integer division, no bitwise
--- operators, no utf8, no blocking, no real sleeping.
+-- 兼容性：Lua 5.2 / CC:Tweaked 的 Cobalt。不用整除、不用位运算、不用 utf8、不阻塞、
+-- 不做真实 sleep。
 
 local tempo = {}
 
--- The bare warning code emitted when the song's NOMINAL tick interval is below
--- MIN_TIMER_MS (see the header).  Never fired merely because one delay is 0.
+-- 当歌曲的**标称** tick 间隔低于 MIN_TIMER_MS 时发出的裸警告码（见文件头）。
+-- 绝不因为某一个 delay 为 0 就触发。
 tempo.CLAMP_WARN_CODE = "tempo-clamp"
 
--- The os.startTimer world-tick granularity, in milliseconds.  A NOMINAL tick
--- interval below this cannot be represented by the clock at all.
+-- os.startTimer 的世界 tick 粒度，单位毫秒。低于此值的**标称** tick 间隔完全无法被
+-- 时钟表示。
 tempo.MIN_TIMER_MS = 50
 
--- is_finite_number(value): true for a real, finite number; rejects NaN (the
--- only value not equal to itself) and both infinities.
+-- is_finite_number(value)：对一个真实、有限的数字为 true；拒绝 NaN（唯一不等于自身的
+-- 值）与两个无穷。
 local function is_finite_number(value)
   return type(value) == "number"
     and value == value
@@ -102,10 +86,9 @@ local function is_finite_number(value)
     and value ~= -math.huge
 end
 
--- bad_tick_ms(origin, value): the typed refusal for a corrupt nominal interval.
--- The decoder rejects a non-positive stored tempo first (E_BAD_TEMPO); this is
--- the tempo module's own backstop for a caller that hands the interval over
--- directly.
+-- bad_tick_ms(origin, value)：对一个损坏的标称间隔的带类型拒绝。解码器会先把非正的
+-- 存储 tempo 拒绝为 E_BAD_TEMPO；这是 tempo 模块自己的兜底，针对直接把间隔交给它的
+-- 调用方。
 local function bad_tick_ms(origin, value)
   return {
     code = "E_BAD_TICK_MS",
@@ -118,10 +101,9 @@ end
 
 -- tempo.tick_ms(analysis) -> number
 --
--- The nominal duration of one tick, exposed for consumers.  Analysis reports
--- ticks_per_second directly; the tempo itself is its reciprocal.  The backstop
--- above applies: a non-finite or non-positive rate is refused loudly instead
--- of returning inf/NaN to a scheduler.
+-- 一个 tick 的标称时长，暴露给消费者。Analysis 直接报告 ticks_per_second；tempo
+-- 本身就是它的倒数。上面的兜底适用：非有限或非正的速率会被大声拒绝，而不是把
+-- inf/NaN 交给调度器。
 function tempo.tick_ms(analysis)
   local ticks_per_second = analysis.ticks_per_second
   if not is_finite_number(ticks_per_second) or ticks_per_second <= 0 then
@@ -132,12 +114,9 @@ end
 
 -- infer_tick_ms(sorted_events) -> number | nil
 --
--- The smallest positive gap between the t_ms of consecutive events.  Because
--- distinct ticks are whole multiples of the nominal interval apart, this gap
--- is an UPPER BOUND on the true interval: it can never under-report a
--- sub-granularity tempo, so a caller that does not pass opts.tick_ms still
--- gets the clamp warning when the song genuinely needs it.  nil when no two
--- distinct event times exist.
+-- 相邻事件 t_ms 之间最小的正间隔。因为不同的 tick 都是标称间隔的整数倍，所以这个
+-- 间隔是真实间隔的**上界**：它绝不可能低估一个亚粒度 tempo，因此未传 opts.tick_ms
+-- 的调用方在歌曲确实需要时仍能拿到 clamp 警告。当不存在两个不同的事件时间时为 nil。
 local function infer_tick_ms(sorted_events)
   local smallest = nil
   for index = 2, #sorted_events do
@@ -151,10 +130,9 @@ end
 
 -- stable_sort_by_t(events) -> array
 --
--- Order events by ascending t_ms; events sharing a t_ms keep their original
--- ARRAY order (Lua's table.sort is not stable, so the original index is used
--- as the tie-break).  This is what lets the scheduler fire by ideal time while
--- preserving author-supplied order for simultaneous notes.
+-- 按 t_ms 升序排列事件；共享同一 t_ms 的事件保持它们原来的**数组**顺序（Lua 的
+-- table.sort 不稳定，所以用原索引作为并列时的决胜键）。正是这一点让调度器按理想
+-- 时间触发，同时为同时发声的音符保留作者提供的顺序。
 local function stable_sort_by_t(events)
   local indexed = {}
   for i = 1, #events do
@@ -176,7 +154,7 @@ local function stable_sort_by_t(events)
 end
 
 -- ---------------------------------------------------------------------------
--- Instance
+-- 实例
 -- ---------------------------------------------------------------------------
 
 local Tempo = {}
@@ -184,17 +162,14 @@ Tempo.__index = Tempo
 
 -- tempo.new(opts) -> t
 --
---   opts.clock    REQUIRED.  The injected clock seam (see player/clock.lua).
---   opts.warn     optional function(code); called with a BARE code, at most
---                 once per code per run.
---   opts.on_event optional function(event); default callback for play().
---   opts.tick_ms  optional.  The song's NOMINAL tick interval in milliseconds
---                 (1000 / ticks_per_second) -- the value the clamp warning is
---                 derived from.  When supplied it MUST be a finite, positive
---                 number; a zero/NaN/infinite interval raises the typed table
---                 E_BAD_TICK_MS immediately (backstop for corrupt input, see
---                 the header).  When omitted the interval is inferred from the
---                 events passed to play() (smallest positive gap).
+--   opts.clock    必填。注入的时钟接缝（见 player/clock.lua）。
+--   opts.warn     可选 function(code)；以**裸**码调用，每次运行同码至多一次。
+--   opts.on_event 可选 function(event)；play() 的默认回调。
+--   opts.tick_ms  可选。歌曲的**标称** tick 间隔，单位毫秒
+--                 （1000 / ticks_per_second）——clamp 警告就是从这个值推导的。提供时
+--                 它**必须**是一个有限正数；零/NaN/无穷的间隔会立即抛出带类型的表
+--                 E_BAD_TICK_MS（对损坏输入的兜底，见文件头）。省略时，间隔从传给
+--                 play() 的事件推得（最小的正间隔）。
 local function new(opts)
   opts = opts or {}
   local clock_obj = opts.clock
@@ -232,7 +207,7 @@ local function new(opts)
   return self
 end
 
--- _warn_once(): emit CLAMP_WARN_CODE at most once for the current run.
+-- _warn_once()：对当前运行至多发出一次 CLAMP_WARN_CODE。
 function Tempo:_warn_once()
   if self.warned then
     return
@@ -243,21 +218,18 @@ function Tempo:_warn_once()
   end
 end
 
--- _schedule_next(): arm ONE timer for the next event not yet dispatched.
+-- _schedule_next()：为下一个尚未派发的事件武装**一个** timer。
 --
--- The delay is ALWAYS (ideal - now), recomputed from the cumulative ideal
--- timeline -- never tick_ms added to a previous delay.  This is the anti-drift
--- rule in action.
+-- delay **永远**是 (ideal - now)，从累计理想时间线重新计算——绝不是把 tick_ms 加到
+-- 上一个 delay 上。这就是抗漂移规则在起作用。
 --
--- ONE TIMER PER DEADLINE, NOT PER EVENT.  When this timer fires, EVERY event
--- whose ideal time has arrived is dispatched together (see _on_fire).  The clock
--- can only advance in whole world ticks (0.05 s -- see the header), so a song
--- denser than 20 events per second CANNOT give each event a timer of its own.
--- Chaining one timer per event did exactly that, and pinned playback to 20
--- events/second: a real 148 events/second song therefore ran ~7.5x SLOW, measured
--- at 1087 s of wall clock for a 143 s song.  Grouping by deadline is what lets a
--- dense song play at its real tempo, and it costs nothing when events are sparse
--- -- such a song simply drains one event per firing, exactly as before.
+-- **每个截止时间一个 timer，而不是每个事件一个**。当这个 timer 触发时，**每一个**理想
+-- 时间已到达的事件会被一起派发（见 _on_fire）。时钟只能以整世界 tick（0.05 s——见
+-- 文件头）前进，所以一首密于每秒 20 个事件的歌**无法**给每个事件各自的 timer。以往
+-- 每个事件串一个 timer 恰恰就是这么做的，它把播放钉死在每秒 20 个事件：因此一首真实
+-- 每秒 148 个事件的歌跑得慢了约 7.5 倍，实测一首 143 秒的歌花了 1087 秒墙钟。按截止
+-- 时间分组，才是让密集的歌以其真实 tempo 播放的原因；而当事件稀疏时它没有任何代价——
+-- 这样的歌每次触发只排空一个事件，与以往完全一样。
 function Tempo:_schedule_next()
   if self.cancelled then
     return
@@ -271,10 +243,9 @@ function Tempo:_schedule_next()
   local now = self.clock.now_ms()
   local delay_ms = ideal - now
 
-  -- DEFENCE IN DEPTH (B4): a non-finite delay can never satisfy the clock's
-  -- `deadline <= limit` test, so the session would hang forever.  Refuse it
-  -- loudly here and let NOTHING reach the clock -- corrupt timing input must
-  -- fail, not become a dead deadline.
+  -- 纵深防御（B4）：非有限的 delay 永远无法满足时钟的 `deadline <= limit` 判定，
+  -- 所以会话会永远挂起。在这里大声拒绝它，让**任何东西**都无法到达时钟——损坏的时序
+  -- 输入必须失败，而不是变成一个死掉的截止时间。
   if not is_finite_number(delay_ms) then
     error({
       code = "E_BAD_DELAY",
@@ -288,28 +259,25 @@ function Tempo:_schedule_next()
   end
 
   local self_ref = self
-  -- DOT call: clock methods take no explicit self (see header).
+  -- 点号调用：时钟方法不接受显式 self（见文件头）。
   self.handle = self.clock.after(delay_ms / 1000, function()
     self_ref:_on_fire()
   end)
 end
 
--- _on_fire(): a deadline was reached -- dispatch every event that is now due.
+-- _on_fire()：一个截止时间到了——派发每一个现在到期的事件。
 --
--- Three phases, in this order, and each order is load-bearing:
+-- 三个阶段，顺序如此，且每个顺序都承重：
 --
---   A. TAKE every event whose ideal time has arrived, advancing the index and
---      recording the metrics as each is taken.
---   B. ARM the next timer from the ideal timeline -- BEFORE running any user
---      callback.  This is why taking and dispatching are separate steps: the
---      chain must be intact before on_event can raise, or a single bad callback
---      would stall every remaining event in the song.
---   C. DISPATCH the events that were taken.
+--   A. **取出**每一个理想时间已到达的事件，取出时推进索引并记录指标。
+--   B. 从理想时间线**武装**下一个 timer——在运行任何用户回调**之前**。这正是取出与
+--      派发要分成两步的原因：链条必须在 on_event 有机会抛错之前保持完整，否则一个
+--      坏回调就会卡住歌里剩下的每一个事件。
+--   C. **派发**已取出的事件。
 --
--- Each callback is pcall'd individually so that one raising note cannot discard
--- the OTHER notes that share its deadline.  The first raise is re-thrown at the
--- end, so the clock still captures exactly one error and playback continues --
--- the same observable contract as before.
+-- 每个回调单独 pcall，好让一个抛错的音符不会丢弃与其共享截止时间的**其他**音符。
+-- 第一个抛错在最后被重新抛出，所以时钟仍然恰好捕获到一个错误、播放继续进行——
+-- 与以往相同的可观测契约。
 function Tempo:_on_fire()
   if self.cancelled then
     return
@@ -317,19 +285,16 @@ function Tempo:_on_fire()
 
   local actual = self.clock.now_ms()
 
-  -- A. Take the next event UNCONDITIONALLY, then every further event now due.
+  -- A. **无条件**取出下一个事件，然后再取出每一个现在已经到期的后续事件。
   --
-  -- Taking the FIRST unconditionally is what GUARANTEES PROGRESS, and it is not a
-  -- convenience -- it is required.  A firing can arrive a hair EARLY: the clock
-  -- rounds its requested delay, and a positive delay can round to ZERO steps, so
-  -- the callback runs at the very instant it was armed.  A plain "is this event
-  -- due?" guard takes nothing in that case, and the chain then re-arms the same
-  -- deadline at the same instant -- forever.  Consuming one event per firing bounds
-  -- the number of firings by the number of events.
+  -- 无条件取出**第一个**，才是**保证前进**的东西，这不是为了方便——而是必需。一次
+  -- 触发可能来得**早**一点点：时钟会对请求的 delay 取整，而一个正 delay 可能被取整
+  -- 成**零**步，于是回调就在它被武装的同一瞬间运行。此时一个单纯的“这个事件到期了
+  -- 吗？”守卫什么都取不到，链条接着在同一瞬间重新武装同一个截止时间——永远如此。
+  -- 每次触发消费一个事件，就把触发次数以事件数为上界约束住了。
   --
-  -- The per-event scheduler this replaced behaved the same way: whatever deadline
-  -- fired, that event was dispatched.  An event may therefore fire up to one
-  -- rounding step early, and max_drift_ms reports that honestly.
+  -- 被它取代的逐事件调度器行为相同：无论哪个截止时间触发，那个事件就被派发。因此
+  -- 一个事件至多可能提前一个取整步长触发，而 max_drift_ms 会如实地报告这一点。
   local due = {}
   while self.index <= #self.events do
     local event = self.events[self.index]
@@ -350,11 +315,10 @@ function Tempo:_on_fire()
       self.metrics.actual_end_ms = actual
     end
 
-    -- B2: whether an event is "clamped" is a property of the song's NOMINAL
-    -- tempo, never of this delay.  A zero/negative delay simply means the event
-    -- is due now (the first note, or a chord's later notes) and is NOT counted.
-    -- In a genuinely sub-granularity song every DISPATCHED event counts, because
-    -- the clock cannot represent the requested tempo at all.
+    -- B2：一个事件是否“clamped”，是歌曲**标称** tempo 的属性，绝不是这个 delay 的
+    -- 属性。零/负的 delay 只说明该事件现在就该到点（第一个音符，或和弦中靠后的
+    -- 音符），**不**计入。在一首真正亚粒度的歌里，每一个**已派发**的事件都计数，因为
+    -- 时钟根本无法表示所请求的 tempo。
     if self.clamp_active then
       self.metrics.clamped_ticks = self.metrics.clamped_ticks + 1
       self:_warn_once()
@@ -363,10 +327,10 @@ function Tempo:_on_fire()
     due[#due + 1] = event
   end
 
-  -- B. Arm the next deadline before dispatching anything.
+  -- B. 在派发任何东西之前先武装下一个截止时间。
   self:_schedule_next()
 
-  -- C. Dispatch, one pcall each, re-throwing the first raise.
+  -- C. 派发，每个单独 pcall，重新抛出第一个抛错。
   if self.run_callback ~= nil then
     local first_error = nil
     for index = 1, #due do
@@ -383,11 +347,10 @@ end
 
 -- t:play(events, on_event) -> handle
 --
--- Begin scheduling.  Each event is placed at start_ms + event.t_ms on the IDEAL
--- timeline; simultaneous events fire in array order.  Does NOT block: it only
--- schedules on the injected clock and returns the handle (self).
+-- 开始调度。每个事件被放在**理想**时间线的 start_ms + event.t_ms 处；同时发生的事件
+-- 按数组顺序触发。**不**阻塞：它只在注入的时钟上调度并返回 handle（self）。
 function Tempo:play(events, on_event)
-  -- Make play idempotent-safe: cancel any previous run before starting a new one.
+  -- 让 play 对幂等安全：开始新的一次运行之前，先取消上一次。
   self:cancel()
 
   self.events = stable_sort_by_t(events or {})
@@ -405,10 +368,9 @@ function Tempo:play(events, on_event)
     clamped_ticks = 0,
   }
 
-  -- The NOMINAL tick interval decides clamping (see the header).  An explicit
-  -- opts.tick_ms is authoritative; otherwise derive the smallest positive gap
-  -- between distinct event times.  A non-finite interval is corrupt input:
-  -- refuse it before a single deadline is computed.
+  -- **标称** tick 间隔决定是否 clamp（见文件头）。显式的 opts.tick_ms 是权威的；
+  -- 否则推导不同事件时间之间最小的正间隔。非有限的间隔是损坏输入：在计算出任何一个
+  -- 截止时间之前就拒绝它。
   local nominal = self.tick_ms
   if nominal == nil then
     nominal = infer_tick_ms(self.events)
@@ -425,8 +387,8 @@ end
 
 -- t:cancel()
 --
--- Stop scheduling; idempotent.  Cancels the one pending clock handle (if any)
--- and flips a flag that makes any in-flight callback a no-op.
+-- 停止调度；幂等。取消那一个待处理的时钟 handle（如果有），并翻转一个标志，让任何
+-- 正在途中的回调变成空操作。
 function Tempo:cancel()
   self.cancelled = true
   if self.handle ~= nil and self.clock.cancel ~= nil then
@@ -437,10 +399,9 @@ end
 
 -- t:stats() -> table
 --
--- Live metrics for the current (or most recent) run.  `clamped_ticks` counts
--- events scheduled while the song's NOMINAL tick interval was below
--- MIN_TIMER_MS -- i.e. events whose delay the clock cannot represent
--- faithfully -- NOT events that merely happened to be due immediately.
+-- 当前（或最近一次）运行的实时指标。`clamped_ticks` 统计的是歌曲**标称** tick 间隔
+-- 低于 MIN_TIMER_MS 期间所调度的事件——即时钟无法忠实表示其 delay 的事件——而**不是**
+-- 那些刚好立即到期的事件。
 function Tempo:stats()
   return self.metrics
 end

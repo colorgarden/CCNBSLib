@@ -1,81 +1,76 @@
 -- player/speaker.lua
 --
--- THE INJECTABLE SPEAKER SEAM.
+-- **可注入的扬声器接缝**。
 --
--- The rest of the player NEVER reaches for the global `peripheral` table
--- directly.  Every hardware access is funnelled through this module, so the
--- SAME player code can be driven by three different tiers:
+-- 播放器的其余部分**从不**直接去够全局的 `peripheral` 表。所有硬件访问都汇集经过
+-- 这个模块，于是**同一份**播放器代码可以由三个不同的层级驱动：
 --
---   1. pure Lua unit tests, where there is no `peripheral` global at all;
---   2. a CraftOS-PC headless harness that replaces the `peripheral` API with a
---      recorder -- see speaker.mock, which captures every call in order;
---   3. real Minecraft, where `peripheral` is the live CC:Tweaked API.
+--   1. 纯 Lua 单元测试，那里根本没有 `peripheral` 全局；
+--   2. 一个 CraftOS-PC 无头测试台，它用一个记录器替换 `peripheral` API —— 见
+--      speaker.mock，它按顺序捕获每一次调用；
+--   3. 真实 Minecraft，那里 `peripheral` 是活的 CC:Tweaked API。
 --
--- FROZEN PUBLIC INTERFACE (the dispatch, fan-out and Tier-2 layers depend on
--- these EXACT names):
+-- 冻结的公共接口（dispatch、扇出与 Tier-2 层依赖这些**精确**的名字）：
 --
 --   local speaker = require("player.speaker")
 --
---   speaker.discover()             -> array of speaker records, sorted by side
---   speaker.wrap(side, obj)        -> speaker record adapting a live peripheral
---   speaker.mock(side)             -> speaker record that RECORDS calls
+--   speaker.discover()             -> 扬声器记录数组，按 side 排序
+--   speaker.wrap(side, obj)        -> 适配一个活外设的扬声器记录
+--   speaker.mock(side)             -> 一个**记录**调用的扬声器记录
 --
--- A speaker record:
+-- 一条扬声器记录：
 --   { side        = "left",
 --     play_note   = function(self, name, volume, pitch) -> boolean,
 --     play_sound  = function(self, name, volume, pitch) -> boolean,
 --     stop        = function(self) }
 --
--- A mock record adds:
+-- mock 记录额外带：
 --   record.calls  = array of { method = "play_note"|"play_sound"|"stop",
 --                              args   = { ... } }
---   record.drain() -> returns the accumulated calls and CLEARS the buffer.
+--   record.drain() -> 返回累积的调用并**清空**缓冲区。
 --
--- HARD RULES (enforced by the test suite):
+-- 硬性规则（由测试套件强制）：
 --
---   * This module must NOT hard-code a call to the peripheral type-search
---     shortcut (the find helper).  Discovery uses ONLY getNames() and getType();
---     any other key on the peripheral global is off limits to the runtime core.
---   * This module must NOT capture the `peripheral` global at module scope.
---     The global is read lazily, inside function bodies only, and nil-checked,
---     so requiring this file in plain Lua 5.2 with no `peripheral` present is
---     safe.
+--   * 本模块**不得**硬编码调用外设的类型搜索捷径（find 辅助）。发现（discovery）
+--     只用 getNames() 与 getType()；外设全局上的任何其他键，运行时核心都不得染指。
+--   * 本模块**不得**在模块作用域捕获 `peripheral` 全局。这个全局只在函数体内惰性
+--     读取，并做 nil 检查，所以在没有 `peripheral` 的纯 Lua 5.2 下 require 本文件
+--     是安全的。
 --
--- REFUSALS ARE NOT ERRORS.  A CC:Tweaked speaker may accept only a handful of
--- playNote calls per game tick, so playNote/playSound returning false is a
--- normal refusal, not a failure.  The adapter therefore FORWARDS that boolean
--- unchanged -- it must never be swallowed or normalised away.
+-- **拒绝不是错误**。一个 CC:Tweaked 扬声器每游戏 tick 可能只接受屈指可数的几次
+-- playNote 调用，所以 playNote/playSound 返回 false 是正常拒绝，不是失败。因此
+-- 适配器**原样转发**这个布尔值 —— 它**绝不能**被吞掉或被归一化。
 --
--- Compatibility: Lua 5.2 / CC:Tweaked Cobalt.  No integer division, no bitwise
--- operators, no utf8, no string.dump, no os.exit.
+-- 兼容性：Lua 5.2 / CC:Tweaked 的 Cobalt。不用整除、不用位运算、不用 utf8、
+-- 不用 string.dump、不用 os.exit。
 
 local speaker = {}
 
 -- ---------------------------------------------------------------------------
--- Lazy access to the global peripheral table
+-- 惰性访问全局 peripheral 表
 -- ---------------------------------------------------------------------------
 
--- Read the global only when called, never at module scope.  Missing entirely in
--- plain Lua unit tests, where every entry point must degrade gracefully.
+-- 只在被调用时读取这个全局，绝不在模块作用域读。纯 Lua 单元测试里它完全缺失，
+-- 那里每个入口都必须优雅降级。
 local function live_peripheral()
   return rawget(_G, "peripheral")
 end
 
 -- ---------------------------------------------------------------------------
--- speaker.mock(side) -> recording record
+-- speaker.mock(side) -> 记录型记录
 -- ---------------------------------------------------------------------------
 
--- Append one recorded call to the record's buffer.  `self` is the record the
--- caller invoked the method on; `buffer_owner` is the closed-over record, used
--- as a fallback so the buffer survives a drain() that swapped the table.
+-- 把一次记录到的调用追加到记录的缓冲区。`self` 是调用方在其上调用方法的记录；
+-- `buffer_owner` 是闭包捕获的记录，作为回退，以便在 drain() 换掉表之后缓冲区仍
+-- 然存活。
 local function append_call(self, buffer_owner, method, ...)
   local calls = (self and self.calls) or buffer_owner.calls
   calls[#calls + 1] = { method = method, args = { ... } }
 end
 
--- speaker.mock(side): a speaker record that performs no I/O.  Every method
--- records { method = ..., args = {...} } in call order and returns true: a mock
--- never refuses.  Used by unit tests and by the Tier-2 headless harness.
+-- speaker.mock(side)：一条不做任何 I/O 的扬声器记录。每个方法按调用顺序记录
+-- { method = ..., args = {...} } 并返回 true：mock 从不拒绝。单元测试与 Tier-2
+-- 无头测试台都会用它。
 function speaker.mock(side)
   local record = {
     side = side,
@@ -97,8 +92,8 @@ function speaker.mock(side)
     return true
   end
 
-  -- drain(): hand back the accumulated calls and start a fresh buffer, so each
-  -- Tier-2 step can assert on a clean slate.
+  -- drain()：交还累积的调用并开一个全新缓冲区，这样每个 Tier-2 步骤都能在干净的
+  -- 起点上做断言。
   function record.drain()
     local drained = record.calls
     record.calls = {}
@@ -109,13 +104,12 @@ function speaker.mock(side)
 end
 
 -- ---------------------------------------------------------------------------
--- speaker.wrap(side, peripheral_object) -> adapter record
+-- speaker.wrap(side, peripheral_object) -> 适配器记录
 -- ---------------------------------------------------------------------------
 
--- Look up one camelCase peripheral method.  A peripheral that lacks a method
--- must fail loudly and specifically, naming the side and the method, rather
--- than crash later with a nil-index.  Checked per call, so a peripheral that
--- exposes playNote but not playSound can still play notes.
+-- 查一个 camelCase 的外设方法。缺少方法的外设必须响亮而明确地失败，并点名 side
+-- 与方法，而不是稍后因 nil 索引而崩溃。每次调用都检查，所以一个只暴露了 playNote
+-- 却没有 playSound 的外设，仍然能弹音符。
 local function require_method(peripheral_object, side, camel, snake)
   local fn = peripheral_object[camel]
   if type(fn) ~= "function" then
@@ -126,32 +120,30 @@ local function require_method(peripheral_object, side, camel, snake)
   return fn
 end
 
--- speaker.wrap(side, peripheral_object): adapt an already-obtained peripheral
--- object.  CC:Tweaked's speaker exposes camelCase playNote / playSound / stop;
--- this maps the seam's snake_case methods onto them and forwards the boolean
--- return of playNote/playSound unchanged (refusals must reach the caller).
+-- speaker.wrap(side, peripheral_object)：适配一个已经拿到手的外设对象。
+-- CC:Tweaked 的扬声器暴露 camelCase 的 playNote / playSound / stop；这里把接缝的
+-- snake_case 方法映射到它们上面，并把 playNote/playSound 的布尔返回值原样转发
+-- （拒绝必须到达调用方）。
 --
--- THE PERIPHERAL'S METHODS TAKE NO `self` -- CALL THEM DOT-STYLE.
+-- **外设的方法不接受 `self` —— 必须用点号调用。**
 --
--- This is the same convention issue AGENTS.md section 3 records for the http
--- response handle, and getting it wrong here was a real, silent defect: every
--- note was passed as `playNote(peripheral_object, name, volume, pitch)`, so
--- `instrumentA` received a TABLE instead of the instrument name. The speaker
--- throws "Invalid instrument" for that, dispatch contains the raise in a pcall,
--- and playback therefore advanced normally through the whole song in total
--- silence -- the progress bar was right and nothing was audible.
+-- 这与 AGENTS.md 第 3 节为 http 响应句柄记录的是同一条调用约定，而在这里弄错它是
+-- 一次真实、静默的缺陷：每个音符都被传成
+-- `playNote(peripheral_object, name, volume, pitch)`，于是 `instrumentA` 收到的
+-- 是一张**表**而不是乐器名。扬声器为此抛出 "Invalid instrument"，dispatch 把这个
+-- 抛错兜在 pcall 里，播放因此正常地走完整首歌却**完全无声** —— 进度条是对的，
+-- 但什么都听不见。
 --
--- The evidence, not a guess:
---   * the Java signature is
+-- 依据是证据，不是猜测：
+--   * Java 签名是
 --       public final boolean playNote(ILuaContext context, String instrumentA,
 --                                     Optional<Double> volumeA, Optional<Double> pitchA)
---     and ILuaContext is INJECTED, not a Lua argument, so from Lua the method
---     takes exactly (instrument, volume, pitch);
---   * CC:Tweaked's own usage is `speaker.playSound("entity.creeper.primed")`.
+--     而 ILuaContext 是**注入**的，不是 Lua 参数，所以从 Lua 看这个方法恰好只收
+--     (instrument, volume, pitch) 三个参数；
+--   * CC:Tweaked 自己的用法是 `speaker.playSound("entity.creeper.primed")`。
 --
--- Contrast the RECORDS this returns: those ARE Lua tables whose methods take
--- `self` and are called with a colon (`record:play_note(...)`). Two conventions in
--- one module, and the seam boundary is exactly where they change.
+-- 反过来看本函数返回的**记录**：它们是 Lua 表，其方法接受 `self` 并以冒号调用
+-- （`record:play_note(...)`）。一个模块里两种约定，而接缝边界正是它们切换的地方。
 function speaker.wrap(side, peripheral_object)
   if type(peripheral_object) ~= "table" then
     error(string.format(
@@ -163,19 +155,19 @@ function speaker.wrap(side, peripheral_object)
 
   function record.play_note(self, name, volume, pitch)
     local fn = require_method(peripheral_object, side, "playNote", "play_note")
-    -- DOT call: no self. See the note above.
+    -- 点号调用：不传 self。见上面的说明。
     return fn(name, volume, pitch)
   end
 
   function record.play_sound(self, name, volume, pitch)
     local fn = require_method(peripheral_object, side, "playSound", "play_sound")
-    -- DOT call: no self.
+    -- 点号调用：不传 self。
     return fn(name, volume, pitch)
   end
 
   function record.stop(self)
     local fn = require_method(peripheral_object, side, "stop", "stop")
-    -- DOT call: no self.
+    -- 点号调用：不传 self。
     return fn()
   end
 
@@ -183,13 +175,12 @@ function speaker.wrap(side, peripheral_object)
 end
 
 -- ---------------------------------------------------------------------------
--- speaker.discover() -> array of records for every attached speaker
+-- speaker.discover() -> 每个已挂载扬声器对应一条记录的数组
 -- ---------------------------------------------------------------------------
 
--- A discovered record resolves its live object lazily, on first method call,
--- through the global peripheral.wrap(side).  discover() itself therefore reads
--- ONLY getNames/getType -- never the find helper, never wrap -- which is what
--- the "no hard-coded find in the runtime core" guard in the spec checks.
+-- 一条被发现的记录在首次方法调用时，通过全局 peripheral.wrap(side) 惰性地解析它
+-- 的活对象。所以 discover() 本身**只**读 getNames/getType —— 从不用 find 辅助，
+-- 从不用 wrap —— 这正是规范里「运行时核心不得硬编码 find」这条守卫所检查的。
 local function discovered_record(side)
   local record = { side = side }
   local wrapped = nil
@@ -231,12 +222,10 @@ local function discovered_record(side)
   return record
 end
 
--- speaker.discover(): enumerate attached peripherals, keep only speakers, and
--- return their records sorted by side name ASCENDING (stable, reproducible fan
--- out and Tier-2 recordings).  With no `peripheral` global at all -- plain Lua
--- unit tests -- it returns an EMPTY ARRAY instead of raising.  Each getType
--- call is pcall-guarded: a peripheral whose type lookup RAISES is skipped
--- rather than allowed to abort discovery of the healthy speakers.
+-- speaker.discover()：枚举已挂载外设，只留下扬声器，并按 side 名**升序**返回它们
+-- 的记录（稳定、可复现的扇出与 Tier-2 录制）。在**完全没有** `peripheral` 全局时
+-- ——纯 Lua 单元测试——它返回一个**空数组**而不是抛错。每次 getType 调用都有 pcall
+-- 守护：一个类型查询**抛错**的外设会被跳过，而不是让它中断对健康扬声器的发现。
 function speaker.discover()
   local peripheral = live_peripheral()
   if peripheral == nil then
@@ -257,10 +246,9 @@ function speaker.discover()
   local records = {}
   if type(names) == "table" then
     for _, side in ipairs(names) do
-      -- One uncooperative peripheral must not abort discovery of the others:
-      -- a getType that raises (absent/erroring peripheral) is treated as "not a
-      -- speaker" and the scan continues.  The final ascending-side sort keeps
-      -- discovery deterministic either way.
+      -- 一个不配合的外设不能中断对其余外设的发现：抛错的 getType（外设缺失/出错）
+      -- 会被当作「不是扬声器」，扫描继续。最后按 side 升序的排序无论如何都让发现
+      -- 保持确定性。
       local ok, kind = pcall(get_type, side)
       if ok and kind == "speaker" then
         records[#records + 1] = discovered_record(side)
