@@ -397,6 +397,120 @@ function cli.speaker_count(count)
   return tostring(number) .. " speakers"
 end
 
+-- cli.display_width(text) -> the number of COLUMNS text occupies
+--
+-- Not the character count: on a CC:T terminal a CJK glyph takes TWO cells. Counting
+-- characters would let a Chinese line pass a width check and then be clipped -- the
+-- exact failure this function exists to prevent -- and song titles and layer names are
+-- routinely CJK, so it is not a hypothetical.
+--
+-- The test is the common wide range (CJK and the fullwidth forms) rather than a whole
+-- Unicode East Asian Width table: a Lua module running on a 1 MB computer disk is not
+-- the place for one, and everything a .nbs file carries is ASCII, CP1252 or that range.
+function cli.display_width(text)
+  local value = tostring(text or "")
+  local columns = 0
+  for index = 1, #value do
+    local byte = value:byte(index)
+    if byte < 0x80 then
+      columns = columns + 1
+    elseif byte >= 0xE0 and byte <= 0xEF then
+      -- A three-byte UTF-8 sequence: one character, two columns.
+      columns = columns + 2
+    elseif byte >= 0x80 and byte < 0xC0 then
+      -- A CONTINUATION byte, already counted with its lead byte.
+      columns = columns + 0
+    else
+      -- A two- or four-byte sequence: one column, which is right for Latin/Greek/
+      -- Cyrillic and good enough outside the BMP.
+      columns = columns + 1
+    end
+  end
+  return columns
+end
+
+-- cli.wrap_text(text, width) -> array of lines
+--
+-- `term.write` DOES NOT WRAP. AGENTS.md section 3 records the measurement, and
+-- `TextBuffer.write` bounds-checks past the right edge, so the overflow is simply GONE.
+-- A 77-character menu on a 51-column terminal therefore read "…-- play a different
+-- RECO" and the user had no way to learn what the options were.
+--
+-- So the CLI wraps for itself:
+--   * on SPACES where possible, so a sentence stays readable;
+--   * HARD, inside a word longer than the line -- a URL or a sound name has no spaces
+--     and overflowing would be clipped, which is the failure being fixed;
+--   * an existing "\n" starts a new line;
+--   * a non-positive width never loops: it falls back to one column.
+function cli.wrap_text(text, width)
+  local limit = tonumber(width) or 0
+  if limit < 1 then
+    limit = 1
+  end
+
+  local source = tostring(text or "")
+  local out = {}
+
+  -- Split on newlines first: an explicit break is a break.
+  for paragraph in (source .. "\n"):gmatch("([^\n]*)\n") do
+    -- Also handle CR, so a message built with CRLF does not carry a stray character.
+    paragraph = paragraph:gsub("\r", "")
+
+    if cli.display_width(paragraph) <= limit then
+      out[#out + 1] = paragraph
+    else
+      local line = ""
+      for word in paragraph:gmatch("%S+") do
+        local separator = (#line > 0) and " " or ""
+        local candidate = line .. separator .. word
+
+        if cli.display_width(candidate) <= limit then
+          line = candidate
+        else
+          if #line > 0 then
+            out[#out + 1] = line
+            line = ""
+          end
+
+          -- The word alone may still be too long: break it by characters.
+          while cli.display_width(word) > limit do
+            local piece = ""
+            local consumed = 0
+            for index = 1, #word do
+              local char = word:sub(index, index)
+              if cli.display_width(piece .. char) > limit then
+                break
+              end
+              piece = piece .. char
+              consumed = index
+            end
+
+            if consumed == 0 then
+              -- A single character wider than the line. Emit it alone rather than
+              -- spinning forever; one clipped character beats a hang.
+              out[#out + 1] = word:sub(1, 1)
+              word = word:sub(2)
+            else
+              out[#out + 1] = piece
+              word = word:sub(consumed + 1)
+            end
+          end
+
+          line = word
+        end
+      end
+      if #line > 0 then
+        out[#out + 1] = line
+      end
+    end
+  end
+
+  if #out == 0 then
+    out[1] = ""
+  end
+  return out
+end
+
 -- cli.progress_line(label, frac, extras, columns) -> a line that FITS.
 --
 -- PURE, apart from reading the terminal size when `columns` is not given, so the
@@ -661,6 +775,7 @@ local function make_writer()
     -- permanent lines still carry the outcome.
     return {
       line = plain,
+      wrapped = plain,
       refresh = function() end,
     }
   end
@@ -697,16 +812,41 @@ local function make_writer()
     end
   end
 
+  -- How many columns the terminal has, measured once. A terminal that cannot report
+  -- its size falls back to the CC:T default rather than to zero, which would wrap
+  -- every message to one character per line.
+  local columns = 51
+  if type(term.getSize) == "function" then
+    local ok, measured = pcall(term.getSize)
+    if ok and type(measured) == "number" and measured > 0 then
+      columns = measured
+    end
+  end
+
+  local function write_line(text)
+    if live then
+      -- Take over the live line's row rather than leaving a blank one behind.
+      -- The cursor is still on that row, so clearLine is all it takes.
+      term.clearLine()
+      live = false
+    end
+    term.write(tostring(text))
+    advance()
+  end
+
   return {
-    line = function(text)
-      if live then
-        -- Take over the live line's row rather than leaving a blank one behind.
-        -- The cursor is still on that row, so clearLine is all it takes.
-        term.clearLine()
-        live = false
+    line = write_line,
+    -- A message WRAPPED to the terminal.
+    --
+    -- `term.write` clips rather than wraps, so anything longer than the screen loses
+    -- its right-hand end silently. The out-of-range menu proved it: its lines are 77
+    -- to 80 characters, the default terminal is 51 columns, and the user saw
+    -- "…-- play a different RECO" with no way to find out what the options were.
+    wrapped = function(text)
+      local lines = cli.wrap_text(text, columns)
+      for index = 1, #lines do
+        write_line(lines[index])
       end
-      term.write(tostring(text))
-      advance()
     end,
     refresh = function(text)
       local _, row = term.getCursorPos()
@@ -1081,7 +1221,7 @@ function cli.run(argv, opts)
   if type(opts.write) == "function" then
     -- A single injected sink receives BOTH kinds, so a test sees exactly the
     -- ordered sequence the terminal would: refreshes included.
-    out = { line = opts.write, refresh = opts.write }
+    out = { line = opts.write, refresh = opts.write, wrapped = opts.write }
   end
   local lib = library()
   local rt = runtime_module()
@@ -1090,12 +1230,16 @@ function cli.run(argv, opts)
   -- shape; every failure is `nbsplay: E_CODE: detail`, so it is machine-readable
   -- as well as readable.  The same rule the library follows when it hands over
   -- `{code = "E_..."}` rather than a sentence.
+  -- Every permanent line goes through `wrapped`, so nothing this program prints can be
+  -- clipped by a terminal narrower than the message. The out-of-range menu is the
+  -- reason: its lines are 77 to 80 characters and the default terminal is 51 columns,
+  -- which is how a user ended up reading "…-- play a different RECO".
   local function say(text)
-    out.line("nbsplay: " .. tostring(text or ""))
+    out.wrapped("nbsplay: " .. tostring(text or ""))
     log("say: " .. tostring(text or ""))
   end
   local function fail(code, detail)
-    out.line("nbsplay: " .. tostring(code) .. ": " .. tostring(detail or ""))
+    out.wrapped("nbsplay: " .. tostring(code) .. ": " .. tostring(detail or ""))
     log(string.format("FAIL %s: %s", tostring(code), tostring(detail or "")))
   end
   local function live(text)
@@ -1171,7 +1315,7 @@ function cli.run(argv, opts)
       out_of_range = policy
       say("out-of-range notes: " .. policy)
     else
-      out_of_range = cli.choose_out_of_range(opts, probe, say, out.line)
+      out_of_range = cli.choose_out_of_range(opts, probe, say, out.wrapped)
     end
   end
 
