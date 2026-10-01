@@ -191,9 +191,20 @@ function plan.plan(song, analysis, opts)
   local total = 0
   for index = 1, #notes do
     local record = notes[index]
-    if layer_format.audible_at(layers, any_solo, record.layer) then
+
+    -- The ROUTE is decided here, once, and carried into the emit loop -- so the
+    -- filter and the event can never disagree about the same note. `mapping.route`
+    -- owns the decision; this only acts on it.
+    local route = mapping.route(
+      instrument_table.bucket_of(record.instrument, vanilla_instrument_count),
+      record.key, out_of_range)
+
+    -- A DROPPED note is filtered out here rather than emitted-and-ignored, so it
+    -- costs no speaker slot. That is the same treatment a muted layer gets, and it is
+    -- what `analyze` assumes when it counts a dropped note as nothing.
+    if route ~= "dropped" and layer_format.audible_at(layers, any_solo, record.layer) then
       total = total + 1
-      grouped[total] = { record = record, position = index }
+      grouped[total] = { record = record, position = index, route = route }
     end
   end
   table.sort(grouped, less_grouped)
@@ -207,6 +218,7 @@ function plan.plan(song, analysis, opts)
 
   for index = 1, total do
     local record = grouped[index].record
+    local route = grouped[index].route
     local tick = record.tick
     local layer = record.layer
 
@@ -236,25 +248,35 @@ function plan.plan(song, analysis, opts)
     local resolved = instrument_table.resolve(record.instrument,
       vanilla_instrument_count)
 
+    -- `kind` and `name` come from the ROUTE the filter already decided, not from a
+    -- second reading of the key -- the two must agree by construction.
     local kind = resolved.kind
     local name = resolved.name
     local ratio = nil
 
-    if kind == "play_note" then
-      local shift = nil
-      if out_of_range == mapping.OUT_OF_RANGE_SHIFT then
-        shift = mapping.shift_for_key(record.key)
-      end
-      if shift ~= nil then
-        -- The note is too far outside its recording's own octave to be reached by
-        -- pitch alone, so a DIFFERENT recording carries the octave and the ratio only
-        -- covers the remaining +/- octave.  `ratio` is what dispatch sends; the old
-        -- play_sound path derived one from the key, which for a shifted note would be
-        -- an octave or two out.
-        kind = "play_sound"
-        name = mapping.shifted_sound_name(name, shift.suffix)
-        ratio = shift.ratio
-      end
+    -- "play_sound" AS A ROUTE HAS TWO SOURCES, and only one of them renames the sound.
+    --
+    --   the instrument itself   a v6 trumpet note is a playSound by nature, already
+    --                           named "minecraft:block.note_block.<...>", and its key
+    --                           is inside the native range
+    --   the SHIFT               a native note too far outside its recording becomes a
+    --                           playSound on an octave-shifted RECORDING
+    --
+    -- `shift_for_key` returns nil for a key in the native range, so the first case must
+    -- not dereference it -- doing so raised on every v6 trumpet note. Asking for the
+    -- shift is what distinguishes them, and only a non-nil answer renames anything.
+    local shift = mapping.shift_for_key(record.key)
+    if kind == "play_note" and route == "play_sound" and shift ~= nil then
+      -- The octave comes from a DIFFERENT RECORDING, and the ratio only has to cover
+      -- the remaining +/- octave.  `ratio` is what dispatch sends; deriving one from
+      -- the key, as the v5-vs-v6 path does, would be an octave or two out.
+      kind = "play_sound"
+      name = mapping.shifted_sound_name(name, shift.suffix)
+      ratio = shift.ratio
+    elseif kind == "play_note" and out_of_range == mapping.OUT_OF_RANGE_CLAMP then
+      -- The CLAMP policy: still a playNote, but on the nearest native pitch, so the
+      -- result does not depend on what the client does with an out-of-range value.
+      kind = "play_note"
     end
 
     local event = {
@@ -268,7 +290,12 @@ function plan.plan(song, analysis, opts)
       name = name,
       custom_index = resolved.custom_index,
       volume = mapping.speaker_volume(combined),
-      pitch = mapping.pitch_semitones(record.key),
+      -- CLAMP flattens to the native edges; every other policy keeps the raw
+      -- semitones (shift passes them but dispatch ignores them in favour of `ratio`,
+      -- passthrough sends them so the client clamps, drop never gets here).
+      pitch = (out_of_range == mapping.OUT_OF_RANGE_CLAMP)
+        and mapping.clamped_pitch(record.key)
+        or mapping.pitch_semitones(record.key),
       pitch_cents = mapping.cents_to_semitones(record.pitch),
       layer_volume = layer_volume,
       -- Non-nil exactly when kind == "play_sound" AND this module chose the ratio.

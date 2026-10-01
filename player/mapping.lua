@@ -219,12 +219,32 @@ function mapping.shift_for_key(key)
   return { suffix = "_-1", ratio = mapping.play_sound_pitch(key + RECORDING_SPAN) }
 end
 
--- mapping.OUT_OF_RANGE_SHIFT -- use the octave-shifted recordings.
+-- THE FOUR POLICIES for a note outside its recording's own octave. They exist
+-- because the situation has no single right answer: it depends on whether the client
+-- has the extra recordings and on what the listener would rather hear.
+--
+--   SHIFT        play an octave-shifted RECORDING -- correct pitch, needs the pack
+--   PASSTHROUGH  send the raw semitones and let the client flatten them to 0.5..2.0
+--   CLAMP        flatten them OURSELVES, to the native 0..24 range
+--   DROP         do not play the note at all
+--
+-- SHIFT and PASSTHROUGH differ in whether a resource pack is required; CLAMP and DROP
+-- are for a listener who has decided the note is wrong either way and prefers a
+-- predictable result. DROP removes the note from the plan entirely, so it costs no
+-- speaker slot -- the same treatment a muted layer gets.
 mapping.OUT_OF_RANGE_SHIFT = "shift"
--- mapping.OUT_OF_RANGE_PASSTHROUGH -- keep the note audible by passing the raw pitch,
--- which the client clamps to the nearest octave. The escape hatch for a client that
--- has NOT installed the resource pack.
 mapping.OUT_OF_RANGE_PASSTHROUGH = "passthrough"
+mapping.OUT_OF_RANGE_CLAMP = "clamp"
+mapping.OUT_OF_RANGE_DROP = "drop"
+
+-- Every accepted policy, in the order a menu should offer them: the one that fixes
+-- the pitch first, then the two that trade pitch for audibility, then silence.
+mapping.OUT_OF_RANGE_POLICIES = {
+  mapping.OUT_OF_RANGE_SHIFT,
+  mapping.OUT_OF_RANGE_PASSTHROUGH,
+  mapping.OUT_OF_RANGE_CLAMP,
+  mapping.OUT_OF_RANGE_DROP,
+}
 
 -- mapping.DEFAULT_OUT_OF_RANGE -- and the default is SHIFT, deliberately.
 --
@@ -238,6 +258,25 @@ mapping.OUT_OF_RANGE_PASSTHROUGH = "passthrough"
 -- mistuned. `extended-range` says so at the start of playback. Anyone who prefers
 -- always-audible-but-wrong can pass "passthrough".
 mapping.DEFAULT_OUT_OF_RANGE = mapping.OUT_OF_RANGE_SHIFT
+
+-- mapping.clamped_pitch(key) -> integer in 0..24
+--
+-- `pitch_semitones` moved to the native edges. This is the CLAMP policy: the note
+-- still plays, on the nearest native pitch, so the result is predictable rather than
+-- dependent on whatever the client does with an out-of-range pitch.
+function mapping.clamped_pitch(key)
+  local pitch = mapping.pitch_semitones(key)
+  if type(pitch) ~= "number" then
+    return 0
+  end
+  if pitch < 0 then
+    return 0
+  end
+  if pitch > 24 then
+    return 24
+  end
+  return pitch
+end
 
 -- mapping.route(bucket, key, out_of_range) -> "play_note" | "play_sound" | "custom"
 --
@@ -263,12 +302,26 @@ function mapping.route(bucket, key, out_of_range)
     -- Already a name-based sound; the policy does not change that.
     return "play_sound"
   end
-  if out_of_range == mapping.OUT_OF_RANGE_SHIFT
-    and mapping.shift_for_key(key) ~= nil then
-    -- A vanilla note too far outside the recording's own octave: it has to become a
-    -- playSound with an octave-shifted recording, which costs a whole speaker-tick.
+
+  -- A vanilla note inside its recording's own octave is untouched by any policy.
+  if mapping.shift_for_key(key) == nil then
+    return "play_note"
+  end
+
+  if out_of_range == mapping.OUT_OF_RANGE_SHIFT then
+    -- A different RECORDING carries the octave, so this becomes a playSound, which
+    -- costs a whole speaker-tick rather than a share of eight.
     return "play_sound"
   end
+  if out_of_range == mapping.OUT_OF_RANGE_DROP then
+    -- "dropped" is a fourth outcome, not a kind of call: player/plan.lua emits no
+    -- event for it and nbs/analyze.lua counts it as nothing, so a dropped note costs
+    -- no speaker slot at all.
+    return "dropped"
+  end
+
+  -- PASSTHROUGH and CLAMP both stay a playNote; they differ only in the pitch
+  -- argument, which player/plan.lua chooses.
   return "play_note"
 end
 

@@ -179,14 +179,29 @@ function analyze.analyze(song, opts)
   -- not, so they must not influence which window is reported.
   local capacity_notes = 0
   local items = {}
+  -- Whether an AUDIBLE note has been seen yet, kept separately from `#items`.
+  --
+  -- `#items == 0` was used as "this is the first audible note" to seed the key range,
+  -- which held while every audible note was appended to `items`. It stopped holding
+  -- when the out-of-range DROP policy began filtering notes out: the dropped ones never
+  -- reach `items`, so the seed condition stayed true and each later note RESET the
+  -- range instead of extending it. With two dropped notes the song reported keys
+  -- 45..69 instead of 20..69.
+  --
+  -- A separate flag also makes the INTENT explicit: the range describes every audible
+  -- note -- mute/solo only -- and deliberately ignores the playback policy, because the
+  -- warning exists to say "this song needs the extended-range pack", which stays true
+  -- whether or not the user chose to play those notes.
+  local saw_audible = false
   for index = 1, total_notes do
     local note = notes[index]
 
     if layers_module.audible_at(layers, any_solo, note.layer) then
       local key = note.key
-      if #items == 0 then
+      if not saw_audible then
         -- The FIRST audible note seeds the range, not the file's first note: a
         -- muted note must not define the song's key span.
+        saw_audible = true
         min_key = key
         max_key = key
       else
@@ -207,16 +222,21 @@ function analyze.analyze(song, opts)
       local instrument_bucket = instrument_table.bucket_of(note.instrument,
         header.vanilla_instrument_count)
       local bucket = mapping.route(instrument_bucket, note.key, out_of_range)
+      -- "dropped" is deliberately NOT consuming: the note never reaches a speaker, so
+      -- counting it would over-state the requirement. It is also not "playable", so
+      -- it does not make the song look like it has something to play.
       local consumes = bucket == "play_note" or bucket == "play_sound"
       if consumes then
         playable_notes = playable_notes + 1
         capacity_notes = capacity_notes + 1
       end
-      items[#items + 1] = {
-        t = note.tick * tick_ms,
-        bucket = bucket,
-        consumes = consumes,
-      }
+      if bucket ~= "dropped" then
+        items[#items + 1] = {
+          t = note.tick * tick_ms,
+          bucket = bucket,
+          consumes = consumes,
+        }
+      end
     end
   end
 

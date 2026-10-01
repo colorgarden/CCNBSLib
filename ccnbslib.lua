@@ -100,6 +100,7 @@ local fanout_module = require("player.fanout")
 local tempo_module = require("player.tempo")
 local cp1252_module = require("nbs.cp1252")
 local runtime_module = require("player.runtime")
+local speakers_module = require("nbs.speakers")
 
 local ccnbs = {}
 
@@ -128,6 +129,21 @@ ccnbs.runtime = runtime_module
 -- caller pre-check how many speakers exist before calling play().
 function ccnbs.discover_speakers()
   return speaker_module.discover()
+end
+
+-- ccnbs.speaker_requirement(analysis) -> integer
+--
+-- HOW MANY SPEAKERS THE ANALYSED SONG NEEDS, so a caller can compare that with what is
+-- attached.  `discover_speakers` answers "how many are there"; without this one there
+-- was no counterpart for "how many are needed", and a caller could not tell whether two
+-- speakers were two ENOUGH.
+--
+-- A thin pass-through to nbs.speakers.required_count, which owns the formula -- the
+-- pipeline is deliberately thin at this level, so nothing is recomputed or normalised
+-- here.  The figure follows the analysis it is given, so with the extended-range policy
+-- in play it reflects that policy's cost.
+function ccnbs.speaker_requirement(analysis)
+  return speakers_module.required_count(analysis)
 end
 
 -- is_song(value): the RELIABLE song discriminator -- NOT a guess from a field a

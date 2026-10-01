@@ -47,6 +47,13 @@ local function raw_global(name)
   return nil
 end
 
+-- FORWARD DECLARED, not defined here. `cli.choose_out_of_range` uses this, and Lua
+-- resolves a name LEXICALLY AT COMPILE TIME -- so a `local function read_seam` declared
+-- further down would leave that reference looking up a GLOBAL, which is nil, and the
+-- interactive menu would raise the moment it was reached. Two earlier bugs in this
+-- project's history were exactly this (`terminal` and `log`).
+local read_seam
+
 -- `try(ok, value)` unpacks a protected call.  Written as `pcall(require, "x")`
 -- with a literal name so a dependency scan can see it.
 local function try(ok, value)
@@ -69,10 +76,41 @@ local default_clock = try(pcall(require, "player.clock"))
 -- a mistake is silent (a bar that never fills, a clock that reads 0:00)
 -- ---------------------------------------------------------------------------
 
+-- The four out-of-range policies, with the one line each that a user needs in order
+-- to choose. The library owns the VALUES (player/mapping.lua); this table owns the
+-- wording, because presenting a choice is the CLI's job and the library never writes
+-- a sentence.
+cli.OUT_OF_RANGE_CHOICES = {
+  {
+    value = "shift",
+    label = "shift        -- play a different RECORDING, two octaves up/down",
+    note = "correct pitch, but the client needs the extranotes resource pack",
+  },
+  {
+    value = "passthrough",
+    label = "passthrough  -- send the raw pitch and let the client flatten it",
+    note = "always audible, but everything beyond one octave becomes the edge note",
+  },
+  {
+    value = "clamp",
+    label = "clamp        -- flatten it ourselves to the native range",
+    note = "predictable and in range, but the pitch is still wrong",
+  },
+  {
+    value = "drop",
+    label = "drop         -- do not play the note at all",
+    note = "nothing is heard, and the note costs no speaker slot",
+  },
+}
+
 -- cli.usage() -> the two lines a user sees when they run it wrong.
 function cli.usage()
-  return "usage: nbsplay [--debug] <url>",
-    "  <url> is a direct link to a .nbs file; --debug writes " .. cli.LOG_PATH
+  return "usage: nbsplay [--debug] [--policy <name>] <url>",
+    "  <url> is a direct link to a .nbs file",
+    "  --policy " .. table.concat(cli.policy_names(), "|")
+      .. "  how to play notes outside the native range",
+    "           (default: ask, unless there are none)",
+    "  --debug  writes " .. cli.LOG_PATH
 end
 
 -- cli.parse_url(argv) -> url | nil, error
@@ -95,26 +133,202 @@ function cli.parse_url(argv)
   return nil, "no http:// or https:// URL given"
 end
 
+-- The native key range, read from the library when it exposes one and falling back to
+-- NBS's own documented bounds. Read rather than hardcoded so the CLI cannot drift from
+-- the mapping that actually decides what is in range.
+local function native_range()
+  local module_ok, mapping = pcall(require, "player.mapping")
+  if module_ok and type(mapping) == "table"
+    and type(mapping.NATIVE_MIN_KEY) == "number" then
+    return mapping.NATIVE_MIN_KEY, mapping.NATIVE_MAX_KEY
+  end
+  return 33, 57
+end
+
+local function native_bounds()
+  local min_key, max_key = native_range()
+  return min_key, max_key
+end
+
+-- cli.describe_warning(code, args) -> string
+--
+-- The library hands over a BARE CODE and never a sentence -- that is the contract, and
+-- the prose renderer was deleted with the interface on purpose. So the CLI is where a
+-- code becomes something a person can act on, and this is the one place that knows how.
+--
+-- PURE, so every message is pinned by the spec without needing to play a song.
+function cli.describe_warning(code, args)
+  args = type(args) == "table" and args or {}
+
+  if code == "extended-range" then
+    -- Two different causes share this code, and they need different advice. Above the
+    -- native range the extranotes pack registers `_1`; below it, `_-1`. The library
+    -- reports the song's keys; which end is out decides whether the pack helps.
+    local native_min, native_max = native_bounds()
+    return string.format(
+      "notes reach key %s..%s, outside the native %s..%s -- install the extranotes "
+        .. "resource pack to hear them at the right pitch",
+      tostring(args.min_key), tostring(args.max_key),
+      tostring(native_min), tostring(native_max))
+  end
+  if code == "speakers" then
+    return string.format(
+      "not enough speakers: this needs %s, found %s, so %s note(s) were dropped",
+      tostring(args.required), tostring(args.found), tostring(args.dropped))
+  end
+  if code == "tempo-clamp" then
+    return "this song's tempo is finer than the 50 ms timer, so some notes land on "
+      .. "the nearest tick"
+  end
+  if code == "notes-dropped" then
+    return string.format(
+      "%s note(s) were refused by a speaker (max 8 per tick per speaker)",
+      tostring(args.count))
+  end
+  if code == "custom-instrument" then
+    return string.format(
+      "%s custom-instrument note(s) were skipped -- a speaker can only play the "
+        .. "vanilla instruments", tostring(args.count))
+  end
+  if code == "play-sound-pitch" then
+    return "a trumpet note was clamped to the speaker's 0.5..2.0 speed range"
+  end
+
+  -- An unrecognised code still gets reported: a warning nobody mentioned is worse
+  -- than one with a terse message.
+  return "warning: " .. tostring(code)
+end
+
+-- cli.choose_out_of_range(opts, probe, say, emit) -> policy string
+--
+-- THE INTERACTIVE CHOICE, and the reason it exists: a note outside its recording's
+-- octave has no single right answer. Playing a shifted recording gets the pitch right
+-- but needs a resource pack; passing it through is always audible but the client
+-- flattens it; clamping is predictable and wrong; dropping is silence. The user is the
+-- only one who knows which they want, so they are asked.
+--
+-- `probe` is an analysis computed with PASSTHROUGH, so the reported key range is the
+-- song's own regardless of any later choice.
+--
+-- ANY NON-ANSWER FALLS BACK TO SHIFT, which is the library's own default. A blank
+-- line, unreadable input, or a typo must not abort a playback the user asked for --
+-- the same reasoning the installer's mirror menu uses.
+function cli.choose_out_of_range(opts, probe, say, emit)
+  local min_key, max_key = native_bounds()
+
+  emit("")
+  say(string.format(
+    "this song reaches keys %s..%s; the native range is %s..%s",
+    tostring(probe.min_key), tostring(probe.max_key),
+    tostring(min_key), tostring(max_key)))
+  say("how should notes outside it be played?")
+  emit("")
+
+  for index = 1, #cli.OUT_OF_RANGE_CHOICES do
+    local choice = cli.OUT_OF_RANGE_CHOICES[index]
+    emit(string.format("nbsplay:   %d) %s", index, choice.label))
+    emit(string.format("nbsplay:        %s", choice.note))
+  end
+  emit("")
+
+  local answer = read_seam(opts, "choose 1-4 (blank = shift): ")
+  if type(answer) ~= "string" then
+    say("nothing was read, so shift is used")
+    return "shift"
+  end
+
+  local trimmed = answer:gsub("%s", "")
+  if trimmed == "" then
+    say("using shift")
+    return "shift"
+  end
+
+  local pick = tonumber(trimmed)
+  if pick == nil or pick ~= math.floor(pick)
+    or pick < 1 or pick > #cli.OUT_OF_RANGE_CHOICES then
+    say("not a listed number, so shift is used")
+    return "shift"
+  end
+
+  local chosen = cli.OUT_OF_RANGE_CHOICES[pick].value
+  say("using " .. chosen)
+  return chosen
+end
+
 -- cli.parse_argv(argv) -> url | nil, debug, error
 --
 -- Separated from parse_url so the URL rule stays exactly as tested: a flag is
 -- REMOVED here rather than being tolerated inside the URL matcher, so any future
 -- flag cannot quietly change what counts as a URL.
+-- cli.parse_argv(argv) -> url | nil, debug, policy | nil, error
+--
+-- Flags may appear anywhere. `--policy <name>` SKIPS the interactive out-of-range menu,
+-- which an unattended caller -- a startup file, a script -- cannot answer. Interactive
+-- remains the default, because the choice genuinely depends on whether the listener has
+-- the resource pack and on what they would rather hear.
+--
+-- An unknown policy name is refused rather than ignored: silently falling back would
+-- play the song a different way from the one that was asked for.
 function cli.parse_argv(argv)
   local debug = false
+  local policy = nil
   local rest = {}
+
   if type(argv) == "table" then
-    for index = 1, #argv do
+    local index = 1
+    while index <= #argv do
       local value = argv[index]
       if value == "--debug" or value == "-debug" or value == "-D" then
         debug = true
+        index = index + 1
+      elseif value == "--policy" then
+        local name = argv[index + 1]
+        if type(name) ~= "string" or not cli.is_policy(name) then
+          return nil, debug, nil,
+            "--policy needs one of: " .. table.concat(cli.policy_names(), ", ")
+        end
+        policy = name
+        index = index + 2
+      elseif type(value) == "string" and value:sub(1, 8) == "--policy" then
+        -- "=form": --policy=shift
+        local name = value:sub(10)
+        if not cli.is_policy(name) then
+          return nil, debug, nil,
+            "--policy needs one of: " .. table.concat(cli.policy_names(), ", ")
+        end
+        policy = name
+        index = index + 1
       else
         rest[#rest + 1] = value
+        index = index + 1
       end
     end
   end
+
   local url, err = cli.parse_url(rest)
-  return url, debug, err
+  return url, debug, policy, err
+end
+
+-- cli.policy_names() -> the accepted policy names, in menu order.
+function cli.policy_names()
+  local names = {}
+  for index = 1, #cli.OUT_OF_RANGE_CHOICES do
+    names[index] = cli.OUT_OF_RANGE_CHOICES[index].value
+  end
+  return names
+end
+
+-- cli.is_policy(value) -> boolean
+function cli.is_policy(value)
+  if type(value) ~= "string" then
+    return false
+  end
+  for index = 1, #cli.OUT_OF_RANGE_CHOICES do
+    if cli.OUT_OF_RANGE_CHOICES[index].value == value then
+      return true
+    end
+  end
+  return false
 end
 
 -- cli.format_time(ms) -> "M:SS", clamped at zero and tolerant of nonsense.
@@ -329,6 +543,27 @@ local function current_clock()
     return default_clock.new_os()
   end
   return nil
+end
+
+-- read_seam(prompt): how the CLI asks the user a question.
+--
+-- Injected through opts.read so a test can answer it. An interactive path that was
+-- never exercised is how the autorun bug survived -- written, never run, silently
+-- wrong. Returns nil when there is no way to read, which callers treat as "said
+-- nothing".
+read_seam = function(opts, prompt)
+  if type(opts) == "table" and type(opts.read) == "function" then
+    return opts.read(prompt)
+  end
+  local reader = raw_global("read")
+  if type(reader) ~= "function" then
+    return nil
+  end
+  local ok, answer = pcall(reader, prompt)
+  if not ok then
+    return nil
+  end
+  return answer
 end
 
 -- ---------------------------------------------------------------------------
@@ -867,7 +1102,7 @@ function cli.run(argv, opts)
     out.refresh(text)
   end
 
-  local url, debug, parse_error = cli.parse_argv(argv)
+  local url, debug, policy, parse_error = cli.parse_argv(argv)
   log, close_log, log_empty = make_logger(debug, cli.LOG_PATH)
   if debug then
     log("nbsplay debug log -- " .. os.date("%Y-%m-%d %H:%M:%S"))
@@ -876,9 +1111,11 @@ function cli.run(argv, opts)
   if url == nil then
     fail("E_USAGE", parse_error)
     -- Help text: left unprefixed, because prefixing every line of it is noise.
-    local first, second = cli.usage()
+    local first, second, third, fourth = cli.usage()
     out.line(first)
     if second then out.line(second) end
+    if third then out.line(third) end
+    if fourth then out.line(fourth) end
     return 1
   end
 
@@ -917,8 +1154,32 @@ function cli.run(argv, opts)
   end
 
   local song = decoded.song
-  local analysis = lib.analyze(song)
-  local events = lib.plan(song, analysis)
+
+  -- WHICH NOTES ARE OUT OF RANGE, asked with PASSTHROUGH because that policy changes
+  -- no event's kind: every audible note stays a play_note, so the count is the number
+  -- of notes that would actually sound and the answer is independent of what the user
+  -- is about to choose.
+  local probe = lib.analyze(song,
+    { out_of_range = "passthrough" })
+  local has_out_of_range = probe.has_extended_range == true
+
+  local out_of_range = "passthrough"
+  if has_out_of_range then
+    if policy ~= nil then
+      -- An unattended caller named a policy, so the menu is skipped -- but it is still
+      -- SAID, so the log and the screen agree about how the song was played.
+      out_of_range = policy
+      say("out-of-range notes: " .. policy)
+    else
+      out_of_range = cli.choose_out_of_range(opts, probe, say, out.line)
+    end
+  end
+
+  -- The POLICY is settled BEFORE planning, because it decides an event's kind and
+  -- therefore the speaker requirement -- choosing afterwards would size the fan-out
+  -- for the wrong cost.
+  local analysis = lib.analyze(song, { out_of_range = out_of_range })
+  local events = lib.plan(song, analysis, { out_of_range = out_of_range })
   local duration = cli.duration_ms(events)
 
   if debug then
@@ -971,18 +1232,38 @@ function cli.run(argv, opts)
   local speakers = lib.discover_speakers()
   local found = type(speakers) == "table" and #speakers or 0
 
+  -- BOTH NUMBERS.  Reporting only how many are attached answers half the question:
+  -- a user cannot tell whether two speakers are two enough.  The requirement is the
+  -- library's figure and follows the policy just chosen, so it has to be read AFTER
+  -- that choice -- which it is.
+  local needed = 0
+  if lib.speaker_requirement ~= nil then
+    needed = lib.speaker_requirement(analysis) or 0
+  end
+
+  local summary = string.format("%s -- %s",
+    cli.speaker_count(found),
+    found >= needed and "enough" or ("needs " .. tostring(needed)))
   say(string.format("\"%s\"  %d notes  %s  %s",
-    title, analysis.total_notes or 0, cli.format_time(duration),
-    cli.speaker_count(found)))
+    title, analysis.total_notes or 0, cli.format_time(duration), summary))
+
   if debug then
     for index = 1, found do
       log(string.format("  speaker[%d] side=%s", index, tostring(speakers[index].side)))
     end
+    log(string.format("  required=%d found=%d", needed, found))
   end
+
   if found == 0 then
     fail("E_NO_SPEAKER", "attach a speaker to a side of the computer, then retry")
     return 1
   end
+
+  -- A shortfall is NOT reported again here: the library already emits its `speakers`
+  -- warning with the numbers (required, found, dropped), and saying it twice in
+  -- different words is how a message becomes noise. The summary line above carries the
+  -- count, and playback continues -- losing notes is the user's call, not a reason to
+  -- refuse a song they asked to hear.
 
   local clock = current_clock()
   if clock == nil then
@@ -1018,6 +1299,14 @@ function cli.run(argv, opts)
     analysis = analysis,
     speakers = speakers,
     clock = clock,
+    out_of_range = out_of_range,
+    -- WARNINGS WERE BEING DISCARDED.  The library emits bare codes and expects the
+    -- caller to word them; a CLI that passes no handler silently loses every one, so
+    -- "no warning appeared" said nothing about whether there had been a problem.
+    on_warning = function(code, args)
+      log(string.format("WARN %s", tostring(code)))
+      say("warning: " .. cli.describe_warning(code, args))
+    end,
     on_progress = function(info)
       local elapsed = tonumber(info.t_ms) or 0
       local frac = duration > 0 and (elapsed / duration) or 0
