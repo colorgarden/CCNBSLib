@@ -105,13 +105,14 @@ cli.OUT_OF_RANGE_CHOICES = {
 
 -- cli.usage() -> the two lines a user sees when they run it wrong.
 function cli.usage()
-  return "usage: nbsplay [--debug] [--policy <name>] <url>",
+  return "usage: nbsplay [--debug] [--policy <name>] [-f] <url>",
     "  <url> is a direct link to a .nbs file",
     "  --policy " .. table.concat(cli.policy_names(), "|")
       .. "  how to play notes outside the native range",
     "           (default: ask, unless there are none)",
+    "  -f, --force   play even if there are too few speakers (drops notes)",
     "  --debug  writes " .. cli.LOG_PATH
-end
+  end
 
 -- cli.parse_url(argv) -> url | nil, error
 --
@@ -272,6 +273,7 @@ end
 function cli.parse_argv(argv)
   local debug = false
   local policy = nil
+  local force = false
   local rest = {}
 
   if type(argv) == "table" then
@@ -281,10 +283,15 @@ function cli.parse_argv(argv)
       if value == "--debug" or value == "-debug" or value == "-D" then
         debug = true
         index = index + 1
+      elseif value == "--force" or value == "-f" then
+        -- Play even when the speakers cannot hold the song. Dropping notes is the
+        -- user's call once they can see the counts; this is how they make it.
+        force = true
+        index = index + 1
       elseif value == "--policy" then
         local name = argv[index + 1]
         if type(name) ~= "string" or not cli.is_policy(name) then
-          return nil, debug, nil,
+          return nil, debug, nil, false,
             "--policy needs one of: " .. table.concat(cli.policy_names(), ", ")
         end
         policy = name
@@ -293,7 +300,7 @@ function cli.parse_argv(argv)
         -- "=form": --policy=shift
         local name = value:sub(10)
         if not cli.is_policy(name) then
-          return nil, debug, nil,
+          return nil, debug, nil, false,
             "--policy needs one of: " .. table.concat(cli.policy_names(), ", ")
         end
         policy = name
@@ -306,7 +313,7 @@ function cli.parse_argv(argv)
   end
 
   local url, err = cli.parse_url(rest)
-  return url, debug, policy, err
+  return url, debug, policy, force, err
 end
 
 -- cli.policy_names() -> the accepted policy names, in menu order.
@@ -1246,7 +1253,7 @@ function cli.run(argv, opts)
     out.refresh(text)
   end
 
-  local url, debug, policy, parse_error = cli.parse_argv(argv)
+  local url, debug, policy, force, parse_error = cli.parse_argv(argv)
   log, close_log, log_empty = make_logger(debug, cli.LOG_PATH)
   if debug then
     log("nbsplay debug log -- " .. os.date("%Y-%m-%d %H:%M:%S"))
@@ -1401,6 +1408,43 @@ function cli.run(argv, opts)
   if found == 0 then
     fail("E_NO_SPEAKER", "attach a speaker to a side of the computer, then retry")
     return 1
+  end
+
+  -- REFUSE A SONG THE SPEAKERS CANNOT HOLD, BEFORE ANY EXPENSIVE WORK.
+  --
+  -- Measured on `RushE.nbs` under the default shift policy: a peak of 109 simultaneous
+  -- play_sounds, so 117 speakers are needed where 43 are attached. The allocator spent
+  -- ELEVEN SECONDS relocating notes to make room for sounds it could never place --
+  -- 43 speakers cannot hold 109 concurrent sounds however the notes are shuffled -- and
+  -- on a real computer that is past the watchdog, so it crashed instead of finishing.
+  --
+  -- The shortfall is already known here, so refusing costs nothing and the futile work
+  -- never starts. `--force` plays anyway: losing notes is the user's call once they can
+  -- see the numbers.
+  --
+  -- A MISSING NUMBER IS NOT A SHORTFALL. An older or partial library exposes no
+  -- `speaker_requirement`, and treating "unknown" as "needs a great many" would refuse
+  -- every song. Only a definite shortfall blocks.
+  if needed > found and not force then
+    fail("E_NOT_ENOUGH_SPEAKERS", string.format(
+      "this needs %d speakers but %d are attached", needed, found))
+    say(string.format(
+      "a speaker holds 8 notes per tick but only 1 sound, and this song peaks at %d "
+        .. "simultaneous ones", analysis.play_sound_notes_at_peak or 0))
+    say("options:")
+    say("  -f, --force       play anyway, dropping whatever does not fit")
+    say("  --policy passthrough   needs far fewer speakers, at the cost of pitch "
+      .. "accuracy")
+    say("  attach more speakers and retry")
+    return 1
+  end
+
+  if needed > found then
+    -- Forcing is a deliberate choice, so it is stated: the user should not have to
+    -- remember that they asked to lose notes.
+    say(string.format(
+      "forced: needs %d speakers, %d attached -- notes that do not fit will be dropped",
+      needed, found))
   end
 
   -- A shortfall is NOT reported again here: the library already emits its `speakers`
