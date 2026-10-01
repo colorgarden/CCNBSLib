@@ -12,7 +12,7 @@ file nbs/layers.lua 8611
 file nbs/notes.lua 5655
 file nbs/reader.lua 6877
 file nbs/speakers.lua 4748
-file nbsplay.lua 53473
+file nbsplay.lua 58823
 file player/clock.lua 15358
 file player/dispatch.lua 14596
 file player/fanout.lua 23591
