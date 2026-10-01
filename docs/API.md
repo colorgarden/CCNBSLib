@@ -20,15 +20,42 @@ local ccnbs = require("ccnbslib")
 | 调用 | 返回 |
 | --- | --- |
 | `ccnbs.decode(bytes)` | 与 `nbs.decode.decode` 完全相同的结构：成功 `{ok=true, song=...}`，失败 `{ok=false, error={code=...}}` |
-| `ccnbs.analyze(song)` | 与 `nbs.analyze.analyze` 完全相同的结构 |
-| `ccnbs.plan(song, analysis)` | 事件数组（冻结全序 `(tick_index, layer_index, note_index)`） |
+| `ccnbs.analyze(song, opts)` | 与 `nbs.analyze.analyze` 完全相同的结构 |
+| `ccnbs.plan(song, analysis, opts)` | 事件数组（冻结全序 `(tick_index, layer_index, note_index)`） |
 | `ccnbs.play(song\|plan, opts)` | 一个**会话** `session`，立即返回、不阻塞（第一个参数可以是歌曲表，也可以是已编排好的事件数组） |
 | `ccnbs.discover_speakers()` | 已挂载扬声器记录数组（side 升序），调用 `player.speaker.discover` |
+| `ccnbs.speaker_requirement(analysis)` | 这首歌**需要几个**扬声器（整数）。与 `discover_speakers` 配对：一个回答「有几个」，一个回答「要几个」 |
 | `ccnbs.cp1252` | CP1252 → UTF-8 显示转换。**唯一**允许做该转换的地方，且只用于显示 |
 | `ccnbs.runtime` | `stop_speakers` / `cleanup`：安全停掉扬声器；另含一个现成的程序框架 |
 | `ccnbs.version` | 版本字符串，例如 `"1.0.0"` |
 
 `decode` / `analyze` / `plan` 是**原样转发**，返回值与直接调用底层模块逐字段一致。
+
+## 超出音域的音符
+
+Minecraft 客户端播放音效时会把音高夹到 `0.5..2.0`，所以**一份录音只能覆盖一个
+八度上下**——更远的音符会被听成边界音。想再远，只能**换一份录在别的八度的音效
+文件**（OpenNBS 官方 extranotes 材质包注册了 `<乐器>_1` / `<乐器>_-1`，各再覆盖
+两个八度）。
+
+因此越界音符怎么处理有四种选择，由 `opts.out_of_range` 指定：
+
+| 取值 | 行为 | 音高 | 需要材质包 | 代价 |
+| --- | --- | --- | --- | --- |
+| `"shift"`（**默认**） | 换偏移录音 | **正确** | **是** | 每个越界音符占满一个扬声器 tick |
+| `"passthrough"` | 原样交给客户端夹 | 被夹到边界 | 否 | 无 |
+| `"clamp"` | 我们自己夹到原生范围 | 被夹到边界 | 否 | 无 |
+| `"drop"` | 不播放这个音符 | — | 否 | 完全静音，但不占扬声器槽 |
+
+覆盖范围：`shift` 下 key **9..81**（六个八度）；其余三种不扩展，超出原生
+`33..57` 即被夹或不发声。
+
+> `shift` 是默认值，因为不这样的话材质包装了也不起作用。**没装材质包就用
+> `"passthrough"`**——否则越界音符会因为音效名解析不到而完全静音。
+
+`opts.out_of_range` 在 `play` / `analyze` / `plan` 上含义一致，且**必须同时传**：
+它决定越界音符的事件种类，而扬声器需求正是按事件种类算的；只传给其中一个会让
+需求数与实际事件不符。
 
 ## 接缝注入（seams）
 
@@ -42,6 +69,7 @@ local ccnbs = require("ccnbslib")
 | `opts.on_warning` | 无 | `function(code, args)`，每个不同的**裸**代码至多回调一次 |
 | `opts.on_progress` | 无 | `function(info)`，`info = {t_ms, index, total}` |
 | `opts.on_event` | 无 | `function(event)`，每个到期事件在**派发之前**回调 |
+| `opts.out_of_range` | `"shift"` | 越界音符怎么处理，见上文〈超出音域的音符〉 |
 
 `play` 只在注入的时钟上排期后立即返回。测试用虚拟时钟通过
 `clock.advance_to(vc, target_ms)` 推进；生产用 os 时钟与真实定时器。
@@ -89,17 +117,17 @@ ccnbs.play(events, { analysis = analysis })   -- 播放已编排好的计划
 
 ## 警告代码
 
-所有警告都经由**同一个** `opts.on_warning(code, args)` 回调上报，每个裸代码
-在每个会话中**至多出现一次**。`ccnbs` 只上报**代码**，不负责渲染
-`WARN[...]` 文本，也绝不直接打印；文本渲染由 `player/warnings.lua` 负责。
+所有警告都汇到**同一个** `opts.on_warning(code, args)` 回调上，每个会话**每个不同的码至多一次**。
+`ccnbs` 只上报**裸码**，不做任何渲染，也不给句子 —— 怎么显示完全由调用方决定。
 
 | 代码 | 触发条件 | `args` |
 | --- | --- | --- |
-| `"extended-range"` | 分析发现存在 33..57 之外的键；**在播放开始时**上报（加载期属性，不是播放中途） | `{min_key, max_key}` |
+| `"extended-range"` | 音符超出 33..57 之间的键**在播放开始时**上报（加载期属性，而非播放中途）。用 `opts.out_of_range` 决定怎么处理它们 | `{min_key, max_key}` |
 | `"speakers"` | 扇出发生丢弃或所需扬声器数不足 | `{peak, required, found, dropped}` |
 | `"custom-instrument"` | 有自定义乐器事件被拒绝播放 | `{count=<n>}` |
 | `"play-sound-pitch"` | 小号音高被夹取进 0.5..2.0 | 无 |
 | `"tempo-clamp"` | 某个延时低于定时器粒度（50 ms） | 无 |
+| `"notes-dropped"` | 扬声器拒绝了音符（每 tick 上限 8 个），这些音符没有发声 | `{count=<n>}` |
 
 ## 调用约定：冒号与点号**故意不统一**
 
