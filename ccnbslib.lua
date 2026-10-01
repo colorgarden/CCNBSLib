@@ -198,9 +198,13 @@ function ccnbs.play(song_or_plan, opts)
   -- re-planned) and needs the caller's matching analysis.
   local events
   local analysis
+  -- The out-of-range POLICY has to reach BOTH the analyzer and the planner, or the
+  -- speaker estimate is sized for a different cost than the events actually incur.
+  local plan_opts = { out_of_range = opts.out_of_range }
+
   if is_song(song_or_plan) then
-    analysis = analyze_module.analyze(song_or_plan)
-    events = plan_module.plan(song_or_plan, analysis)
+    analysis = analyze_module.analyze(song_or_plan, plan_opts)
+    events = plan_module.plan(song_or_plan, analysis, plan_opts)
   elseif is_plan(song_or_plan) then
     events = song_or_plan
     analysis = opts.analysis

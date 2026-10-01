@@ -147,4 +147,129 @@ function mapping.cents_to_semitones(pitch_cents)
   return pitch_cents / 100
 end
 
+-- ---------------------------------------------------------------------------
+-- 5. Extended range: a different RECORDING, not a different pitch
+-- ---------------------------------------------------------------------------
+-- THE LIMIT THIS WORKS AROUND.  `playNote` takes semitones and the server passes
+-- them through -- `SpeakerPeripheral.playNote` only calls `checkFinite` -- but the
+-- CLIENT flattens the result: `SoundEngine.calculatePitch` calls `Mth.clamp` with
+-- PITCH_MIN/PITCH_MAX, i.e. 0.5..2.0.  So one recording reaches exactly one octave
+-- either side of its own pitch, and anything beyond that is heard as the edge note.
+--
+-- THE WAY OUT.  The octave comes from WHICH FILE plays, not from the pitch.  The
+-- extranotes resource pack ships by OpenNBS registers the same instruments recorded
+-- two octaves up and down:
+--
+--     block.note_block.<instrument>_1     two octaves above the original
+--     block.note_block.<instrument>_-1    two octaves below
+--
+-- Playing `_1` at a ratio in 0.5..2.0 therefore covers the two octaves ABOVE the
+-- native range, and `_-1` the two below -- six octaves in total, key 9..81, against
+-- NBS's own 0..87.
+--
+-- `speaker.playSound` can name any of them.  CC does NOT check that a sound is
+-- registered -- `tryGetRegistryObject` is consulted only to refuse music discs, and
+-- a null result passes -- so the name reaches the client, which resolves it against
+-- its own resource packs.  That also means the honest trade-off: a shifted note is
+-- SILENT on a client without the pack, where passing the raw pitch through would
+-- have been audible at the wrong pitch.  That is why the caller chooses a policy.
+
+-- The register of recordings: the native two octaves, plus one either side.
+mapping.SHIFTED_LOW_KEY = 9    -- key 9  -> pitch -24 -> the _-1 recording
+mapping.SHIFTED_HIGH_KEY = 81  -- key 81 -> pitch  48 -> the _1 recording
+
+-- The distance between recordings, in semitones: two octaves.
+local RECORDING_SPAN = 24
+
+-- mapping.shifted_sound_name(name, suffix) -> string
+--
+-- `name` is the instrument's own name as `instrument_table` already produces it
+-- (harp, bass, pling, ...).  Those 16 names are EXACTLY the ones the pack registers,
+-- compared against the pack's own sounds.json, so no translation table is needed.
+function mapping.shifted_sound_name(name, suffix)
+  return "block.note_block." .. tostring(name) .. tostring(suffix)
+end
+
+-- mapping.shift_for_key(key) -> { suffix = "_-1" | "_1", ratio = <number> } | nil
+--
+-- nil when the key is inside the native range, which means "keep using playNote" --
+-- the cheap path, eight notes per speaker per tick.  A non-nil result means the note
+-- has to go through playSound with a different recording, which costs a whole
+-- speaker-tick per note.
+--
+-- The ratio is `play_sound_pitch` called with the key moved by one recording span,
+-- so the arithmetic stays in the one place that already owns it:
+--
+--   _1  recording is 24 semitones higher, so ask for a key 24 lower
+--   _-1 recording is 24 semitones lower,  so ask for a key 24 higher
+--
+-- Over each shifted range that ratio spans exactly 0.5000 .. 2.0000 -- verified --
+-- which is why one extra recording per two octaves is precisely enough and nothing
+-- inside the range needs clamping.
+function mapping.shift_for_key(key)
+  if type(key) ~= "number" then
+    return nil
+  end
+  if key >= mapping.NATIVE_MIN_KEY and key <= mapping.NATIVE_MAX_KEY then
+    return nil
+  end
+  if key > mapping.NATIVE_MAX_KEY then
+    return { suffix = "_1", ratio = mapping.play_sound_pitch(key - RECORDING_SPAN) }
+  end
+  return { suffix = "_-1", ratio = mapping.play_sound_pitch(key + RECORDING_SPAN) }
+end
+
+-- mapping.OUT_OF_RANGE_SHIFT -- use the octave-shifted recordings.
+mapping.OUT_OF_RANGE_SHIFT = "shift"
+-- mapping.OUT_OF_RANGE_PASSTHROUGH -- keep the note audible by passing the raw pitch,
+-- which the client clamps to the nearest octave. The escape hatch for a client that
+-- has NOT installed the resource pack.
+mapping.OUT_OF_RANGE_PASSTHROUGH = "passthrough"
+
+-- mapping.DEFAULT_OUT_OF_RANGE -- and the default is SHIFT, deliberately.
+--
+-- Defaulting to passthrough would mean the resource pack never changes anything: an
+-- out-of-range note would still arrive as a plain pitch and still be clamped, so the
+-- extended range would exist in the code and not in the ear. The feature has to be on
+-- for the pack to matter.
+--
+-- The trade-off is real and is the reason the warning exists: on a client without the
+-- pack a shifted name resolves to nothing, so the note is SILENT rather than merely
+-- mistuned. `extended-range` says so at the start of playback. Anyone who prefers
+-- always-audible-but-wrong can pass "passthrough".
+mapping.DEFAULT_OUT_OF_RANGE = mapping.OUT_OF_RANGE_SHIFT
+
+-- mapping.route(bucket, key, out_of_range) -> "play_note" | "play_sound" | "custom"
+--
+-- THE single owner of "which call does this note become?".  Two modules need this
+-- answer and they MUST agree:
+--
+--   player/plan.lua    decides the event's kind, i.e. which call is made
+--   nbs/analyze.lua    counts how many notes consume a speaker-tick, i.e. how many
+--                      speakers are needed
+--
+-- If they disagreed, the analysis would size the fan-out for a different cost than
+-- the plan actually incurs -- telling the user "two speakers is enough" while notes
+-- are dropped.  So the rule lives here, once, and both call it.
+--
+-- `bucket` is instrument_table's classification ("vanilla" | "play_sound" |
+-- "custom").  `out_of_range` is the caller's policy.
+function mapping.route(bucket, key, out_of_range)
+  if bucket == "custom" then
+    -- A custom instrument is refused at playback and costs nothing.
+    return "custom"
+  end
+  if bucket == "play_sound" then
+    -- Already a name-based sound; the policy does not change that.
+    return "play_sound"
+  end
+  if out_of_range == mapping.OUT_OF_RANGE_SHIFT
+    and mapping.shift_for_key(key) ~= nil then
+    -- A vanilla note too far outside the recording's own octave: it has to become a
+    -- playSound with an octave-shifted recording, which costs a whole speaker-tick.
+    return "play_sound"
+  end
+  return "play_note"
+end
+
 return mapping

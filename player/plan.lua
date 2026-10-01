@@ -154,12 +154,27 @@ end
 
 -- plan.plan(song, analysis) -> array of events.  Pure and total over a decoded
 -- song; see the module header for the full contract.
-function plan.plan(song, analysis)
+-- plan.plan(song, analysis, opts) -> array of events
+--
+-- opts.out_of_range  the playback policy.  `"shift"` routes a note outside its
+--                    recording's octave through an octave-shifted sound file, which
+--                    is the only way to hear it at the right pitch -- the client
+--                    clamps a plain pitch to 0.5..2.0 and everything beyond becomes
+--                    the edge note.  `"passthrough"` keeps the old behaviour, which
+--                    is the right choice for a client WITHOUT the resource pack,
+--                    because a shifted name resolves to nothing and the note would be
+--                    silent rather than merely mistuned.
+--
+-- The DECISION is `mapping.route`'s, shared with nbs/analyze.lua so the capacity
+-- figure and the events cannot disagree.
+function plan.plan(song, analysis, opts)
   local notes = song.notes or {}
   local layers = song.layers or {}
   local header = song.header or {}
   local vanilla_instrument_count = header.vanilla_instrument_count
   local tick_ms = analysis.tick_ms
+  local out_of_range = type(opts) == "table" and opts.out_of_range
+    or mapping.DEFAULT_OUT_OF_RANGE
 
   -- Whether the song is in SOLO mode.  Computed ONCE, over the whole layer array,
   -- because a solo on ANY layer silences every non-solo one -- so this cannot be
@@ -216,9 +231,31 @@ function plan.plan(song, analysis)
     -- NBS combination first, then the speaker 0..3 scaling.
     local combined = mapping.combined_volume(layer_volume, record.velocity)
 
-    -- Which call the speaker must make.  resolve() owns the v5-vs-v6 boundary.
+    -- Which call the speaker must make.  resolve() owns the v5-vs-v6 boundary; the
+    -- SHIFT decision is mapping.route's, which folds in the key and the policy.
     local resolved = instrument_table.resolve(record.instrument,
       vanilla_instrument_count)
+
+    local kind = resolved.kind
+    local name = resolved.name
+    local ratio = nil
+
+    if kind == "play_note" then
+      local shift = nil
+      if out_of_range == mapping.OUT_OF_RANGE_SHIFT then
+        shift = mapping.shift_for_key(record.key)
+      end
+      if shift ~= nil then
+        -- The note is too far outside its recording's own octave to be reached by
+        -- pitch alone, so a DIFFERENT recording carries the octave and the ratio only
+        -- covers the remaining +/- octave.  `ratio` is what dispatch sends; the old
+        -- play_sound path derived one from the key, which for a shifted note would be
+        -- an octave or two out.
+        kind = "play_sound"
+        name = mapping.shifted_sound_name(name, shift.suffix)
+        ratio = shift.ratio
+      end
+    end
 
     local event = {
       t_ms = tick * tick_ms, -- derived per event; never accumulated
@@ -227,13 +264,17 @@ function plan.plan(song, analysis)
       note_index = note_index,
       instrument = record.instrument,
       key = record.key,
-      kind = resolved.kind,
-      name = resolved.name,
+      kind = kind,
+      name = name,
       custom_index = resolved.custom_index,
       volume = mapping.speaker_volume(combined),
       pitch = mapping.pitch_semitones(record.key),
       pitch_cents = mapping.cents_to_semitones(record.pitch),
       layer_volume = layer_volume,
+      -- Non-nil exactly when kind == "play_sound" AND this module chose the ratio.
+      -- The v5-vs-v6 play_sound path leaves it nil and dispatch derives one, so the
+      -- two sources never collide.
+      ratio = ratio,
     }
 
     events[#events + 1] = event

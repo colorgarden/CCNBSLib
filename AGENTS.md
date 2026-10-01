@@ -84,6 +84,7 @@ Never from an API field, a cache, or memory. Measured examples:
 | `term.write("\n")` "makes a newline" | Measured: the row does not change; `"\n"` is an ordinary character that moves the cursor one COLUMN |
 | The docs calling the layer byte "Layer lock" | It is a MUTE/SOLO switch: 1 = muted, 2 = solo (OpenNBS#307, which the published spec omits) |
 | A fixture suite that passes | It cannot see a bug the fixtures do not contain — the mute bug needed a real 65-layer song to appear |
+| "The speaker pitch is passed through, so out-of-range notes sound" | The SERVER passes it through; the CLIENT clamps it. `SoundEngine.calculatePitch` is `Mth.clamp(pitch, PITCH_MIN, PITCH_MAX)` = 0.5..2.0, so one recording reaches one octave either side and everything beyond is heard as the edge note. Two extra octaves need a different RECORDING (`block.note_block.<instrument>_1` / `_-1`, registered by OpenNBS's own extranotes pack), which only `playSound` can name |
 | "A line as wide as the terminal wraps, so the bar scrolls" | `term.write` never wraps — the cursor just passes the edge. The real risk is CLIPPING, and the real defect was the missing newline |
 | A hand-built fake terminal that models `"\n"` or wrapping | It is then wrong in the direction that HIDES the defect; encode only measured facts |
 | Counting live rows left on screen to prove overwriting | The last frame is legitimately replaced by the next permanent line — count WHERE ticks LAND, not what survives |
@@ -174,8 +175,50 @@ would require `playAudio` + DFPWM, which is a different architecture.
 
 ---
 
-### The layer byte is a MUTE/SOLO switch, and the fixtures could not have found it
+### KNOWN AND DEFERRED: the speaker formula over-asks, because two buffers are not one
 
+`nbs/speakers.lua` computes `required = ceil(vanilla / 8) + play_sound` and its comment
+states the reason: "one vanilla note plus one trumpet note needs TWO speakers, not one."
+**The source says otherwise.** `SpeakerPeripheral.update()` flushes two INDEPENDENT
+buffers in the same tick:
+
+```java
+public void update() {
+    clock++;
+    ...
+    synchronized (pendingNotes) {              // all 8 pending playNotes, broadcast
+        for (var sound : pendingNotes) { ...broadcast... }
+        pendingNotes.clear();
+    }
+    ...
+    synchronized (lock) { sound = pendingSound; pendingSound = null; ... }
+    if (shouldStop && lastPosition != null) { ...; return; }   // the ONLY return, after both
+    if (sound != null) { ...send the sound... }
+```
+
+and the two entry points guard only their own buffer: `playNote` refuses when
+`pendingNotes.size() >= maxNotesPerTick`, `playSound` when `pendingSound != null`.
+Neither consults the other. So **one speaker can play 8 notes AND 1 sound in the same
+tick**, and the correct formula is `max(ceil(vanilla / 8), play_sound)`.
+
+This is the same class of error this file keeps recording -- a hand-built model of the
+platform that was never checked against the platform. The comment says "verified by the
+test suite", but the suite verifies the FORMULA's arithmetic, not the platform's
+behaviour.
+
+WHY IT IS STILL LIKE THIS. The formula is CONSERVATIVE: it asks for more speakers than
+necessary, never fewer, so nothing is silently dropped as long as the advice is
+followed. Fixing it properly is not a one-line change -- `player/fanout.lua` models a
+speaker as a single pool of eight slots where a sound displaces notes, and its ENTIRE
+evacuation machinery exists to resolve a conflict that does not occur. The correct
+allocator is smaller: notes and sounds never compete. That rewrite is deferred, on
+purpose, and this note is the reason it must not be forgotten.
+
+What it costs today: `simple.nbs` is told it needs 3 speakers when 2 suffice, and any
+song with shifted notes is over-provisioned. Measured, before and after the extended
+range default: `required` for `simple.nbs` went 1 -> 3.
+
+### The layer byte is a MUTE/SOLO switch, and the fixtures could not have found it
 The published NBS specification calls the per-layer byte "Layer lock" and documents
 only "1 = locked", which reads like an editor permission. It is not. The OpenNBS
 project's own issue tracker says so (OpenNBS/NoteBlockStudio#307):

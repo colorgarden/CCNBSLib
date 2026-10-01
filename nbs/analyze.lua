@@ -120,6 +120,11 @@ local analyze = {}
 
 -- One Minecraft game tick, in milliseconds.  This is the speaker-ceiling window.
 local PEAK_WINDOW_MS = 50
+-- `playNote` calls one speaker accepts per game tick.  Read from nbs.speakers so the
+-- number 8 exists in exactly ONE place -- this module's window selection and that
+-- module's requirement formula must never disagree about the cost of a note.
+local speakers_module = require("nbs.speakers")
+local PEAK_NOTES_PER_TICK = speakers_module.MAX_NOTES_PER_TICK
 
 -- Native two-octave key range (33 = F#3, 45 = F#4, 57 = F#5), inclusive.
 -- The NUMBERS are owned in ONE place: player/mapping.lua's public
@@ -128,7 +133,14 @@ local PEAK_WINDOW_MS = 50
 -- mapping.lua requires nothing, so this creates no require cycle.
 
 -- analyze.analyze(song) -> result
-function analyze.analyze(song)
+-- analyze.analyze(song, opts) -> result
+--
+-- opts.out_of_range  the playback policy, mirroring player/plan.lua's, because the
+--                    two MUST agree: `mapping.route` decides whether a note costs a
+--                    playNote slot (8 per speaker-tick) or a playSound slot (ONE).
+--                    Counting it as the cheaper one here would under-report the
+--                    speaker requirement and notes would be dropped at playback.
+function analyze.analyze(song, opts)
   local header = song.header or {}
   local notes = song.notes or {}
   local layers = song.layers or {}
@@ -148,6 +160,8 @@ function analyze.analyze(song)
   -- the song, not a playback prediction -- so on a song with muted layers it is
   -- legitimately larger than the number of events the planner emits.
   local any_solo = layers_module.any_solo(layers)
+  local out_of_range = type(opts) == "table" and opts.out_of_range
+    or mapping.DEFAULT_OUT_OF_RANGE
 
   -- Key range + extended-range scan (over every AUDIBLE note, independent of the
   -- 50 ms window) plus ONE classification pass: each note's bucket is decided here
@@ -186,9 +200,14 @@ function analyze.analyze(song)
       if key < mapping.NATIVE_MIN_KEY or key > mapping.NATIVE_MAX_KEY then
         has_extended_range = true
       end
-      local bucket = instrument_table.bucket_of(note.instrument,
+      -- THE EFFECTIVE bucket, not the instrument's own. `mapping.route` is the single
+      -- owner of "which call does this note become?", and it folds in the shift
+      -- policy: a vanilla note too far outside its recording's octave becomes a
+      -- playSound, which costs a whole speaker-tick instead of a share of eight.
+      local instrument_bucket = instrument_table.bucket_of(note.instrument,
         header.vanilla_instrument_count)
-      local consumes = bucket == "vanilla" or bucket == "play_sound"
+      local bucket = mapping.route(instrument_bucket, note.key, out_of_range)
+      local consumes = bucket == "play_note" or bucket == "play_sound"
       if consumes then
         playable_notes = playable_notes + 1
         capacity_notes = capacity_notes + 1
@@ -226,16 +245,28 @@ function analyze.analyze(song)
   local peak_left = nil
   local peak_span = 0
   if capacity_notes > 0 then
-    -- Prefix count of the capacity-consuming notes, so each window's capacity
-    -- count is O(1) while the two pointers slide.
-    local prefix = {}
-    prefix[0] = 0
+    -- TWO prefix sums, because the two kinds of note cost DIFFERENT amounts of a
+    -- speaker. A play_note shares a tick with seven others; a play_sound takes the
+    -- whole tick. So the window that needs the most speakers is NOT the window with
+    -- the most notes, and selecting by raw count -- which is what this used to do --
+    -- picks the wrong one as soon as a song mixes the two.
+    --
+    -- Worked example of the disagreement: a window with 1 play_note and 2
+    -- play_sounds needs ceil(1/8) + 2 = 3 speakers, while a window with 3 play_notes
+    -- needs ceil(3/8) = 1. Counting notes ranks the second higher.
+    --
+    -- The cost function here is EXACTLY nbs.speakers.required_count's formula, so the
+    -- window it selects is the one that formula is describing.
+    local note_prefix = {}
+    local sound_prefix = {}
+    note_prefix[0] = 0
+    sound_prefix[0] = 0
     for index = 1, audible_notes do
-      local step = 0
-      if items[index].consumes then
-        step = 1
-      end
-      prefix[index] = prefix[index - 1] + step
+      local bucket = items[index].bucket
+      note_prefix[index] = note_prefix[index - 1]
+        + (bucket == "play_note" and 1 or 0)
+      sound_prefix[index] = sound_prefix[index - 1]
+        + (bucket == "play_sound" and 1 or 0)
     end
 
     local j = 1
@@ -246,9 +277,14 @@ function analyze.analyze(song)
       while j <= audible_notes and items[j].t - items[i].t < PEAK_WINDOW_MS do
         j = j + 1
       end
-      local capacity_count = prefix[j - 1] - prefix[i - 1]
-      if capacity_count > peak_capacity then
-        peak_capacity = capacity_count
+      local notes_in_window = note_prefix[j - 1] - note_prefix[i - 1]
+      local sounds_in_window = sound_prefix[j - 1] - sound_prefix[i - 1]
+      -- The same arithmetic as speakers.required_count, applied to this window.
+      local cost = math.floor(notes_in_window / PEAK_NOTES_PER_TICK)
+        + (notes_in_window % PEAK_NOTES_PER_TICK > 0 and 1 or 0)
+        + sounds_in_window
+      if cost > peak_capacity then
+        peak_capacity = cost
         peak_left = i
         peak_span = j - i
       end
@@ -286,7 +322,7 @@ function analyze.analyze(song)
       -- allocator can never disagree about which notes need a playNote and
       -- which need a playSound.
       local bucket = items[index].bucket
-      if bucket == "vanilla" then
+      if bucket == "play_note" then
         vanilla_at_peak = vanilla_at_peak + 1
       elseif bucket == "play_sound" then
         play_sound_at_peak = play_sound_at_peak + 1

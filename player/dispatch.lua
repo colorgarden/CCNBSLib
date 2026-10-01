@@ -248,8 +248,26 @@ local function route_play_sound(self, event, record, speaker_side)
     return no_call(speaker_side, nil)
   end
 
+  -- THE RATIO COMES FROM THE EVENT WHEN IT CARRIES ONE.
+  --
+  -- A shifted note (an octave-shifted recording) has its ratio computed by
+  -- player/plan.lua, because only the planner knows which recording was chosen. The
+  -- old derivation below is correct for the v5-vs-v6 play_sound path, whose name
+  -- refers to the instrument's own pitch -- but applied to a shifted note it is
+  -- simply the wrong number: key 69 would ask for 2^((69-45)/12) = 4.0 and be clamped
+  -- to 2.0, an octave away from the note that was planned.
+  local ratio
+  if type(event.ratio) == "number" then
+    ratio = event.ratio
+    local result = invoke(record, speaker_side, "play_sound",
+      { event.name, event.volume, ratio })
+    -- No warning: a planned ratio is inside 0.5..2.0 by construction, so there is
+    -- nothing to complain about.
+    return result
+  end
+
   local ideal = 2 ^ ((event.key - RATIO_REFERENCE_KEY) / 12)
-  local ratio = mapping.play_sound_pitch(event.key)
+  ratio = mapping.play_sound_pitch(event.key)
   local result = invoke(record, speaker_side, "play_sound",
     { event.name, event.volume, ratio })
 
