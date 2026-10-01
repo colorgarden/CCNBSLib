@@ -345,6 +345,47 @@ function clock.new_os()
     os.sleep(remaining)
   end
 
+  -- pull_once() -> name, p1, p2, …
+  --
+  -- 拉**一个**事件并返回它。是 timer 就派发匹配的 handle；不是就**原样交还**调用方。
+  --
+  -- **为什么必须无过滤。** `os.pullEvent(filter)` 会把不匹配的事件从队列里**丢掉**：
+  -- CobaltLuaMachine 对不匹配的事件不 resume 协程、直接返回，事件就此消失（只有
+  -- `terminate` 豁免）。所以 `run_due()` 里的 `os.pullEvent("timer")` 会静默吃掉一次
+  -- 鼠标点击——进度条一切正常，只是点了没反应，而这是**不抛错**的失效。这与本文件
+  -- 顶部长注里那个 os.epoch 陷阱是同一类问题：错了却看不出来。
+  --
+  -- 消费端因此可以同时等 timer 与用户输入（nbsplay 的点击跳转就是这么做的）。
+  --
+  -- `run_due()` 的语义**不变**：它仍然过滤 timer，仍然一次排空到底。
+  function adapter.pull_once()
+    -- 不带过滤参数 → 任何事件都不会被丢弃。若收到 terminate，os.pullEvent 会
+    -- error("Terminated")，那与现状一致，原样向上抛。
+    local packed = table.pack(os.pullEvent())
+    local name = packed[1]
+
+    if name == "timer" then
+      local timer_id = packed[2]
+      local handle = pending[timer_id]
+      if handle ~= nil then
+        pending[timer_id] = nil
+        if not handle.cancelled and not handle.fired then
+          handle.fired = true
+          -- 和 run_due 同样的错误策略：捕获进 adapter.errors，**绝不**向外抛。一个坏
+          -- 回调不能打断泵，否则整首歌会静默死掉。
+          local ran_ok, err = pcall(handle.fn)
+          if not ran_ok then
+            adapter.errors[#adapter.errors + 1] = { message = tostring(err) }
+          end
+        end
+      end
+      return name
+    end
+
+    -- 非 timer（鼠标、按键、peripheral…）：交还调用方，一个都不丢。
+    return table.unpack(packed, 1, packed.n)
+  end
+
   return adapter
 end
 

@@ -70,6 +70,7 @@ Minecraft 客户端播放音效时会把音高夹到 `0.5..2.0`，所以**一份
 | `opts.on_progress` | 无 | `function(info)`，`info = {t_ms, index, total}` |
 | `opts.on_event` | 无 | `function(event)`，每个到期事件在**派发之前**回调 |
 | `opts.out_of_range` | `"shift"` | 越界音符怎么处理，见上文〈超出音域的音符〉 |
+| `opts.from_ms` | `0` | **从哪里开始播**（毫秒）。播歌曲时会过滤掉更早的事件；播**计划**时该计划必须已过滤，否则抛 `E_PLAN_BEFORE_FROM`。见〈跳转进度〉 |
 
 `play` 只在注入的时钟上排期后立即返回。测试用虚拟时钟通过
 `clock.advance_to(vc, target_ms)` 推进；生产用 os 时钟与真实定时器。
@@ -103,6 +104,45 @@ ccnbs.play(events, { analysis = analysis })   -- 播放已编排好的计划
 省略 `opts.analysis` 时会抛出类型化错误 `E_PLAN_REQUIRES_ANALYSIS`（错误信息点名
 `opts.analysis`），而**不是**一个 nil 算术崩溃。播放歌曲与播放其计划的行为
 **完全一致**：相同的警告、相同的分配、相同的调用序列。
+
+## 跳转进度
+
+`opts.from_ms` 让播放**从指定的毫秒数开始**——也就是跳转（seek）。
+
+### 播歌曲：库帮你过滤
+
+```text
+ccnbs.play(song, { from_ms = 30 * 1000 })   -- 从第 30 秒开始
+```
+
+`plan` 会丢掉所有 `t_ms` 早于 `from_ms` 的事件，于是 `from_ms` 处（或之后最近的）那个
+事件**立刻**到期，而不是先静默等上 30 秒。**事件的 `t_ms` 不会被改写**——它是歌曲上的
+绝对时间戳，所以 `on_progress` 收到的 `info.t_ms` 始终是绝对时间，进度显示不需要加任何
+偏移。
+
+### 播计划：过滤是你的责任
+
+```text
+local analysis = ccnbs.analyze(song)
+local events = ccnbs.plan(song, analysis, { from_ms = 30 * 1000 })
+ccnbs.play(events, { analysis = analysis, from_ms = 30 * 1000 })
+```
+
+`play` 对传入的计划**原样使用**，所以它不会替你过滤。若计划里仍带着更早的事件，那些
+事件的理想截止时间**全在过去**，会被同一瞬间一起播出来。因此这种情况会被**拒绝**：
+
+```text
+E_PLAN_BEFORE_FROM
+```
+
+错误信息会给出改法：先用 `ccnbs.plan(song, analysis, { from_ms = X })` 过滤，或者直接传
+歌曲而不是计划。
+
+### 边界
+
+- `from_ms = 0`（默认）或省略时，行为与不带该选项**完全一致**。
+- `from_ms` 不是有限非负数时视为**未提供**，不会被当成「从很后面开始」而静音整首歌。
+- `from_ms` 超过歌曲长度时，结果是零个事件：播放立即结束。
 
 ## 会话对象 `session`
 
@@ -239,4 +279,4 @@ assert(#left.calls + #right.calls > 0)
 - `ccnbs` 不打印任何内容；警告一律交给 `opts.on_warning`。
 - 自定义乐器**从不**被播放：`play` 会跳过并上报一次 `"custom-instrument"`。
 - 多扬声器同步在 CC:Tweaked 中是尽力而为；`ccnbs` 只保证分配确定性。
-- v1 不支持跳转进度与循环播放。
+- 支持**跳转进度**（`opts.from_ms`，见〈跳转进度〉）；**不支持循环播放**。

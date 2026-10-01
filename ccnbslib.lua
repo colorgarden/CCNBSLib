@@ -197,8 +197,22 @@ function ccnbs.play(song_or_plan, opts)
   local events
   local analysis
   -- 越界**策略**必须同时到达分析器和编排器，否则扬声器估算就会按一个与实际事件开销
-  -- 不同的成本去定尺寸。
+  -- 不同的成本去定尺寸。`from_ms`（seek）只对**编排器**有意义，但放进同一个表最省事
+  -- ——`analyze` 只读自己的键。
+  --
+  -- 非有限或负数一律当作「未提供」：把它读成「从 20 亿毫秒之后开始」会让一次笔误变成
+  -- 一首完全静音的歌，而且**不抛错**。
+  local from_ms = nil
+  if type(opts.from_ms) == "number" and opts.from_ms == opts.from_ms
+    and opts.from_ms ~= math.huge and opts.from_ms ~= -math.huge
+    and opts.from_ms >= 0 then
+    from_ms = opts.from_ms
+  end
+
   local plan_opts = { out_of_range = opts.out_of_range }
+  if from_ms ~= nil then
+    plan_opts.from_ms = from_ms
+  end
 
   if is_song(song_or_plan) then
     analysis = analyze_module.analyze(song_or_plan, plan_opts)
@@ -213,6 +227,22 @@ function ccnbs.play(song_or_plan, opts)
           .. "header, so it cannot size the speakers or the tick interval by "
           .. "itself; pass opts.analysis = ccnbs.analyze(song), or call "
           .. "ccnbs.play(song, opts) with the song instead.",
+      }, 2)
+    end
+
+    -- 一个**未过滤**的 plan 配 from_ms 会让每个 t_ms < from_ms 的事件 ideal 都落在
+    -- 过去，于是它们在同一瞬间**全部炸出来**——而 from_ms 的全部意义就是避免这个。
+    -- 冻结全序下 t_ms 非递减，所以查第一个就是查最小值。
+    if from_ms ~= nil and #events > 0 and events[1].t_ms < from_ms then
+      error({
+        code = "E_PLAN_BEFORE_FROM",
+        msg = "ccnbs.play: this plan starts at t_ms=" .. tostring(events[1].t_ms)
+          .. " but from_ms=" .. tostring(from_ms) .. "; the events before from_ms "
+          .. "would all fire at once. Filter it first with "
+          .. "ccnbs.plan(song, analysis, { from_ms = " .. tostring(from_ms) .. " }), "
+          .. "or pass the song instead of a plan.",
+        t_ms = events[1].t_ms,
+        from_ms = from_ms,
       }, 2)
     end
   else
@@ -308,6 +338,9 @@ function ccnbs.play(song_or_plan, opts)
     -- **权威**的标称 tick 间隔（缺陷 C）。没有它，调度器会从事件时间之间的最小间隔
     -- 去推断间隔，于是**高估**稀疏歌曲的间隔，并**跳过**真正的亚粒度夹取警告。
     tick_ms = analysis.tick_ms,
+    -- seek 锚点：把歌曲原点搬到 from_ms 毫秒之前，好让第一个活下来的事件**立刻**到期，
+    -- 而不是先静默等上 from_ms。nil 时 tempo 视为 0，与旧行为逐字节相同。
+    from_ms = from_ms,
     -- tempo 的 warn 回调交回的是不带 args 的**裸码**。
     warn = function(code)
       emit(code, {})

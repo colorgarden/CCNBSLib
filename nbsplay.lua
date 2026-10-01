@@ -104,7 +104,8 @@ function cli.usage()
       .. "  how to play notes outside the native range",
     "           (default: ask, unless there are none)",
     "  -f, --force   play even if there are too few speakers (drops notes)",
-    "  --debug  writes " .. cli.LOG_PATH
+    "  --debug  writes " .. cli.LOG_PATH,
+    "  during playback, click the progress bar's row to seek (advanced computers)"
   end
 
 -- cli.parse_url(argv) -> url | nil, error
@@ -577,6 +578,44 @@ function cli.progress_line(label, frac, extras, columns)
   return name .. " " .. bare
 end
 
+-- cli.bar_row(frac, columns) -> 一条**恰好占满整行**的进度条，含方括号。
+--
+-- 与 cli.progress_line 的区别在于它**独处一行**：没有标签、没有百分比、没有尾随片段。
+-- 方括号把进度条与空白区分开来——当进度为 0 时整条都是 `-`，没有括号就看不出进度条
+-- 的范围到哪里为止。
+--
+-- 内部委托给 cli.render_bar，而不是自己拼一遍 `#`/`-`：那套钳制逻辑（frac 越界、非数字
+-- 输入、宽度为 0）已经被 render_bar 的测试钉住了，抄第二遍只会多一个会腐烂的副本。
+function cli.bar_row(frac, columns)
+  local width = tonumber(columns) or 51
+  if width < 3 then
+    width = 3
+  end
+  return "[" .. cli.render_bar(frac, width - 2) .. "]"
+end
+
+-- cli.click_fraction(x, columns) -> 0..1
+--
+-- 把点击的**列号**映射成进度。进度条占满整行（见 cli.bar_row），所以列号本身**就是**
+-- 进度轴：第 1 列 = 0，最后一列 = 1，中间线性——不需要知道进度条的内部几何。
+--
+-- 纯函数，钳制越界列；宽度 <= 1 时返回 0（没有可映射的跨度，而不是除零）。
+function cli.click_fraction(x, columns)
+  local width = tonumber(columns)
+  local column = tonumber(x)
+  if width == nil or column == nil or width <= 1 then
+    return 0
+  end
+  local fraction = (column - 1) / (width - 1)
+  if fraction < 0 then
+    return 0
+  end
+  if fraction > 1 then
+    return 1
+  end
+  return fraction
+end
+
 -- cli.duration_ms(events) -> 歌曲长度（毫秒），取自最后一个事件。
 function cli.duration_ms(events)
   if type(events) ~= "table" or #events == 0 then
@@ -632,10 +671,15 @@ end
 
 -- current_clock() -> 为播放计时的那个时钟。
 --
--- 时钟必须被**泵动**，不是交出去就算完。`after()` 只是装上定时器；回调只有在
--- `run_due()` 把 `timer` 事件排干并派发对应 handle 时才会跑。用 os.sleep 轮询**不**
--- 可行：os.sleep 会把事件全部拉走并丢弃，直到自己的定时器触发，于是歌曲的定时器被消费
--- 掉、回调从未被调用——静音，却报告为成功。
+-- 时钟必须被**泵动**，不是交出去就算完。`after()` 只是装上定时器；回调只有在有人把
+-- `timer` 事件取出来、派发对应 handle 时才会跑。
+--
+-- 做这件事的是播放段的循环，用 **`pull_once()`** 而不是 `run_due()`：后者内部是
+-- `os.pullEvent("timer")`，而带过滤的 pullEvent 会把不匹配的事件（点击）**丢掉**
+-- ——见 player/clock.lua 的 pull_once 说明。
+--
+-- 用 os.sleep 轮询同样**不**可行：os.sleep 会把事件全部拉走并丢弃，直到自己的定时器
+-- 触发，于是歌曲的定时器被消费掉、回调从未被调用——静音，却报告为成功。
 local function current_clock()
   if type(seams.clock) == "table" then
     return seams.clock
@@ -762,37 +806,67 @@ local function make_writer()
       -- 本来也没有交互式读取器。
       prompt = plain,
       refresh = function() end,
+      refresh_bar = function() end,
     }
   end
 
-  -- 此刻屏幕上有一条实时行吗？它所在的行就是**光标现在的位置**，因为 `refresh` 总是
-  -- 把光标留在那里。什么都不用记，所以即使歌曲播到一半终端被改变尺寸，这里也仍然正确。
+  -- 两条**实时行**固定在屏幕底部，日志区收缩到它们上方：
+  --
+  --     info_row   = height - 1   信息行（百分比、时间、音符计数）
+  --     bar_row    = height       进度条，**独占一行**
+  --     log_bottom = height - 2   永久行只能落在 1..log_bottom
+  --
+  -- 进度条独自占一整行，所以整行就是进度轴：第 1 列 = 0%、最后一列 = 100%。点击映射
+  -- 因此不需要知道进度条的几何——见 cli.click_fraction。
+  local height = 19
+  if type(term.getSize) == "function" then
+    local ok, _, measured = pcall(term.getSize)
+    if ok and type(measured) == "number" and measured > 0 then
+      height = measured
+    end
+  end
+  local bar_row = height
+  local info_row = height - 1
+  local log_bottom = height - 2
+  if log_bottom < 1 then
+    log_bottom = 1
+  end
+  if info_row < 1 then
+    info_row = 1
+  end
+
+  -- 下一条永久行写在哪（1 起算）。大于 log_bottom 表示「需要先滚动」。
+  local log_row = 1
+  -- 已经画过实时行吗？清与重画都以它为准，不必每次去读光标位置。
   local live = false
 
-  -- 下移一行，到底部则滚动。这正是 `term.write` 不会做的那一步；它是从 bios.lua 的
-  -- `write` 内部那个 `newLine` 辅助函数抄来的，而那是这件事的权威。
-  local function advance()
-    local _, row = term.getCursorPos()
-    if type(row) ~= "number" then
+  -- 光标最终必须停在**日志区**，不能停在实时行上；否则下一条永久行会写到实时行上，
+  -- 或被下一次 refresh 覆盖。
+  local function park_cursor()
+    local row = log_row
+    if row > log_bottom then
+      row = log_bottom
+    end
+    if row < 1 then
+      row = 1
+    end
+    term.setCursorPos(1, row)
+  end
+
+  -- 清掉两条实时行。**必须在任何滚动之前调用**：`term.scroll(1)` 会把整屏内容上移一行，
+  -- 若不清，进度条的残影会被带到 info_row 上面去。清掉之后，下一次 refresh 会把它们
+  -- 重画回来。
+  local function clear_live()
+    if not live then
       return
     end
-
-    local height = row
-    if type(term.getSize) == "function" then
-      local ok, _, measured = pcall(term.getSize)
-      if ok and type(measured) == "number" and measured > 0 then
-        height = measured
-      end
+    term.setCursorPos(1, info_row)
+    term.clearLine()
+    if bar_row ~= info_row then
+      term.setCursorPos(1, bar_row)
+      term.clearLine()
     end
-
-    if row + 1 <= height then
-      term.setCursorPos(1, row + 1)
-    else
-      term.setCursorPos(1, height)
-      if type(term.scroll) == "function" then
-        term.scroll(1)
-      end
-    end
+    live = false
   end
 
   -- 终端有多少列，只测量一次。无法报告自身尺寸的终端，退回 CC:T 的默认值而不是零，
@@ -806,18 +880,38 @@ local function make_writer()
   end
 
   local function write_line(text)
-    if live then
-      -- 接管实时行所占的那一行，而不是在身后留下一个空行。光标仍停在这一行，所以
-      -- clearLine 就够了。
-      term.clearLine()
-      live = false
+    -- 先清实时行：一次滚动会把它们拖走。清掉之后，下一次 refresh 会把它们重画回来。
+    clear_live()
+
+    -- 在日志区底部还要再要一行时，先把整屏上滚一行。`term.write` 自己**不会**滚动
+    -- （Terminal.write 只在当前行内写），所以这一步必须由我们做——它是从 bios.lua 的
+    -- `write` 内部那个 `newLine` 辅助函数抄来的，而那是这件事的权威。
+    if log_row > log_bottom then
+      term.setCursorPos(1, log_bottom)
+      if type(term.scroll) == "function" then
+        term.scroll(1)
+      end
+      log_row = log_bottom
     end
+
+    term.setCursorPos(1, log_row)
+    term.clearLine()
     term.write(tostring(text))
-    advance()
+
+    if log_row < log_bottom then
+      log_row = log_row + 1
+    else
+      log_row = log_bottom + 1 -- 下一次写入之前需要先滚动
+    end
+    park_cursor()
   end
 
   return {
     line = write_line,
+    -- 几何：调用方（点击映射）必须与实际画出来的那一行、那一列完全一致，所以由这里
+    -- **量一次**并交出去，而不是让调用方再测一次——两次测量之间终端可能已改变尺寸。
+    columns = columns,
+    bar_row = bar_row,
     -- 一条**折行**到终端的消息。
     --
     -- `term.write` 是裁剪而不是折行，所以任何长过屏幕的内容都会静默地丢掉右端。越界
@@ -829,30 +923,40 @@ local function make_writer()
         write_line(lines[index])
       end
     end,
-    -- 一条**提示语**：写在光标所在处，并且把光标**留在那里**，因为用户就在这一行上输入，
-    -- 而 `read` 从当前位置回显。若下移一行，答案就会落到下一行，提示语也会被孤零零地
-    -- 留在原地。
+    -- 一条**提示语**：写出来，并把光标**留在这一行**，因为用户就在它后面输入，而 `read`
+    -- 从当前位置回显。若下移一行，答案就会落到下一行，提示语则被孤零零留在原地。
     --
     -- 它之所以存在，是因为 `read` 不接受提示语参数——见 read_seam——所以提示语必须由
     -- 我们自己写出。
     prompt = function(text)
-      if live then
-        term.clearLine()
-        live = false
+      clear_live()
+      local row = log_row
+      if row > log_bottom then
+        row = log_bottom
       end
-      term.write(tostring(text))
-    end,
-    refresh = function(text)
-      local _, row = term.getCursorPos()
-      if type(row) == "number" then
-        term.setCursorPos(1, row)
-      end
+      term.setCursorPos(1, row)
       term.clearLine()
       term.write(tostring(text))
-      if type(row) == "number" then
-        term.setCursorPos(1, row)
-      end
+      -- 用户的回答会占用这一行，所以下一条永久行要写到它下面一行。
+      log_row = row + 1
+    end,
+    -- 信息行（height - 1）。进度百分比、时间与音符计数都在这里。
+    refresh = function(text)
       live = true
+      term.setCursorPos(1, info_row)
+      term.clearLine()
+      term.write(tostring(text))
+      park_cursor()
+    end,
+    -- 进度条行（height）。**独占一行、整行都是进度轴**，所以点击任意一列都能直接映射成
+    -- 进度——这就是 cli.click_fraction 只用列号的原因。文本由 cli.bar_row 生成，宽度恰好
+    -- 等于终端列数。
+    refresh_bar = function(text)
+      live = true
+      term.setCursorPos(1, bar_row)
+      term.clearLine()
+      term.write(tostring(text))
+      park_cursor()
     end,
   }
 end
@@ -1082,6 +1186,16 @@ local function instrument_clock(clock, log)
     return ran
   end
 
+  -- 转发 pull_once。**必须转发**：--debug 正是用来查「点了没反应」这类问题的，若包装器
+  -- 不转发，调试模式下的点击会静默失效——工具把问题藏起来是最糟的形态。
+  --
+  -- 非 timer 事件（鼠标）不写日志：一次播放里点击可能很多，逐条记录只会把日志淹掉，
+  -- 而「点击是否到达」由定时器序列本身就看得出来。
+  function wrapped.pull_once()
+    local name, p1, p2, p3 = clock.pull_once()
+    return name, p1, p2, p3
+  end
+
   return wrapped
 end
 
@@ -1205,9 +1319,37 @@ function cli.run(argv, opts)
     out = {
       line = opts.write,
       refresh = opts.write,
+      refresh_bar = opts.write,
       wrapped = opts.write,
       prompt = opts.write,
     }
+  end
+
+  -- 进度条的行号与终端列数。**优先用写手量出来的值**：进度条就是按那个行号、那个宽度
+  -- 画出来的，点击映射必须与画出来的东西完全对应。只有在没有写手几何时（测试注入的
+  -- 接收器）才自己量一次。
+  local columns = tonumber(out.columns)
+  local bar_row = tonumber(out.bar_row)
+  if columns == nil or bar_row == nil then
+    local measured_columns, measured_height = 51, 19
+    local term_geom = terminal()
+    if type(term_geom) == "table" and type(term_geom.getSize) == "function" then
+      local ok, measured_w, measured_h = pcall(term_geom.getSize)
+      if ok then
+        if type(measured_w) == "number" and measured_w > 0 then
+          measured_columns = measured_w
+        end
+        if type(measured_h) == "number" and measured_h > 0 then
+          measured_height = measured_h
+        end
+      end
+    end
+    if columns == nil then
+      columns = measured_columns
+    end
+    if bar_row == nil then
+      bar_row = measured_height
+    end
   end
   local lib = library()
   local rt = runtime_module()
@@ -1226,8 +1368,13 @@ function cli.run(argv, opts)
     out.wrapped("nbsplay: " .. tostring(code) .. ": " .. tostring(detail or ""))
     log(string.format("FAIL %s: %s", tostring(code), tostring(detail or "")))
   end
-  local function live(text)
-    out.refresh(text)
+  -- live(info, bar)：信息行 + 进度条行。`bar` 可省略——下载阶段就没有独立的进度条行，
+  -- 它的百分比与字节数都在同一条信息里。
+  local function live(info, bar)
+    out.refresh(info)
+    if bar ~= nil then
+      out.refresh_bar(bar)
+    end
   end
 
   local url, debug, policy, force, parse_error = cli.parse_argv(argv)
@@ -1239,11 +1386,19 @@ function cli.run(argv, opts)
   if url == nil then
     fail("E_USAGE", parse_error)
     -- 帮助文本：不加前缀，因为给它每一行都加前缀只是噪音。
-    local first, second, third, fourth = cli.usage()
-    out.line(first)
-    if second then out.line(second) end
-    if third then out.line(third) end
-    if fourth then out.line(fourth) end
+    --
+    -- **逐行迭代，不硬编码参数个数。** 这里原来解构的是 `first..fourth`，于是 `usage()`
+    -- 后来加上的第 5、6 行（`-f, --force` 与 `--debug`）**从未出现在帮助里**——而帮助是
+    -- 用户唯一能发现这些选项的地方。返回几行就打印几行，两者就不会再各走各的。
+    --
+    -- **走 `wrapped`，不是 `line`。** `out.line` 用 `term.write`，它是**裁剪**而不是折行
+    -- （AGENTS.md §3 记了实测），而帮助里有好几行远宽于 51 列的终端：`--policy` 那行 83
+    -- 列、`-f, --force` 69 列。用 `line` 打印等于把右端静默切掉——「…-- play a different
+    -- RECO」正是这么来的。`wrapped` 就是为这种情况存在的。
+    local usage_lines = table.pack(cli.usage())
+    for index = 1, usage_lines.n do
+      out.wrapped(usage_lines[index])
+    end
     return 1
   end
 
@@ -1425,9 +1580,10 @@ function cli.run(argv, opts)
     fail("E_NO_CLOCK", "player.clock is missing, so playback cannot be timed")
     return 1
   end
-  if type(clock.run_due) ~= "function" then
-    -- 拒绝而不是降级：轮询驱动不了这个时钟，所以在这里接受它，等于接受一首无声的歌。
-    fail("E_NO_CLOCK", "this clock cannot be driven (no run_due)")
+  if type(clock.pull_once) ~= "function" then
+    -- 拒绝而不是降级：轮询驱动不了这个时钟，而且退回 run_due() 会**静默丢掉点击**——
+    -- 那正是「进度条正常、点了没反应」这类不可见失效。宁可在这里停住。
+    fail("E_NO_CLOCK", "this clock cannot be driven (no pull_once)")
     return 1
   end
 
@@ -1447,52 +1603,160 @@ function cli.run(argv, opts)
     clock = instrument_clock(clock, log)
   end
 
+  -- --- seek 支撑 ------------------------------------------------------------------
+  --
+  -- 原始**完整**计划。seek 必须从它重新过滤——绝不能拿 `session.plan`（那是上一次 seek
+  -- 的子集）当基准，否则往回跳就跳不回去。
+  local full_events = events
+  -- 点击映射的分母：歌曲「时长」= 最后一个事件的 t_ms（cli.duration_ms）。seek 期间
+  -- **恒定不变**；若从剩余计划重算，分母会变小，点击就会漂移。
+  local duration_ms = duration
+
+  -- 跨 seek 的**警告去重**。`session.cancel()` 会补发被推迟的 custom-instrument 计数
+  -- 警告，所以不去重的话每跳一次就重印一遍同一句。库的「每个码每会话至多一次」保证不变，
+  -- 这里只是 CLI 不多打印。
+  local shown_warns = {}
+  local function warn_to_screen(code, args)
+    if shown_warns[code] then
+      return
+    end
+    shown_warns[code] = true
+    log(string.format("WARN %s", tostring(code)))
+    say("warning: " .. cli.describe_warning(code, args))
+  end
+
   local progress_logged = 0
-  local session = lib.play(events, {
-    analysis = analysis,
-    speakers = speakers,
-    clock = clock,
-    out_of_range = out_of_range,
-    -- 警告曾被**丢弃**。库发出裸码、并期待调用方为它措辞；一个不传任何处理器的 CLI
-    -- 会静默丢掉每一条，于是「没有警告出现」对「之前有没有出过问题」什么也说明不了。
-    on_warning = function(code, args)
-      log(string.format("WARN %s", tostring(code)))
-      say("warning: " .. cli.describe_warning(code, args))
-    end,
-    on_progress = function(info)
-      local elapsed = tonumber(info.t_ms) or 0
-      local frac = duration > 0 and (elapsed / duration) or 0
-      -- 信息量最大的在前：先是时钟，然后是音符计数。装不下的那个才被丢掉。
-      live(cli.progress_line("playing", frac, {
-        "  " .. cli.format_time(elapsed) .. "/" .. cli.format_time(duration),
-        string.format("  note %d/%d",
-          tonumber(info.index) or 0, tonumber(info.total) or 0),
-      }))
-      -- 限流：21247 次回调会把日志淹掉。
-      progress_logged = progress_logged + 1
-      if progress_logged <= 10 or progress_logged % 200 == 0 then
-        log(string.format("progress %d/%s  t_ms=%s (%s)",
-          tonumber(info.index) or 0, tostring(info.total), tostring(info.t_ms),
-          cli.format_time(elapsed)))
+  -- 提成命名函数：seek 会**重开会话**，而重开时要把同一个进度回调再传进去。
+  local function progress_handler(info)
+    local elapsed = tonumber(info.t_ms) or 0
+    local frac = duration_ms > 0 and (elapsed / duration_ms) or 0
+    -- 信息量最大的在前：先是百分比与时钟，然后是音符计数。装不下的那个才被丢掉。
+    live(
+      string.format("playing  %d%%  %s/%s  note %d/%d",
+        math.floor(frac * 100),
+        cli.format_time(elapsed), cli.format_time(duration_ms),
+        tonumber(info.index) or 0, tonumber(info.total) or 0),
+      cli.bar_row(frac, columns))
+    -- 限流：21247 次回调会把日志淹掉。
+    progress_logged = progress_logged + 1
+    if progress_logged <= 10 or progress_logged % 200 == 0 then
+      log(string.format("progress %d/%s  t_ms=%s (%s)",
+        tonumber(info.index) or 0, tostring(info.total), tostring(info.t_ms),
+        cli.format_time(elapsed)))
+    end
+  end
+
+  local session = nil
+  -- 跳到结尾之后循环要立刻结束。用标志而不是把 session 置 nil：收尾清理仍需要一个
+  -- **有效但已取消**的会话去停扬声器。
+  local ended = false
+
+  local function start_session(list, from_ms)
+    return lib.play(list, {
+      analysis = analysis,
+      speakers = speakers,
+      clock = clock,
+      out_of_range = out_of_range,
+      from_ms = from_ms,
+      -- 警告曾被**丢弃**。库发出裸码、并期待调用方为它措辞；一个不传任何处理器的 CLI
+      -- 会静默丢掉每一条，于是「没有警告出现」对「之前有没有出过问题」什么也说明不了。
+      on_warning = warn_to_screen,
+      on_progress = progress_handler,
+    })
+  end
+
+  local function seek_to(target_ms)
+    if target_ms < 0 then
+      target_ms = 0
+    end
+    if target_ms > duration_ms then
+      target_ms = duration_ms
+    end
+
+    if session ~= nil and type(session.cancel) == "function" then
+      session.cancel()
+    end
+
+    -- **跳到结尾是一个显式分支，不能靠「过滤后为空」来实现。** 过滤是 t_ms >= from_ms，
+    -- 而 target_ms == duration_ms 恰好等于最后一个事件的 t_ms，结果含**一个**事件、不是
+    -- 空。没有这个分支，「点最右」会变成「播最后一个音符」——语义错，而且会被谎称为
+    -- 「跳到结尾」。
+    if target_ms >= duration_ms then
+      ended = true
+      return
+    end
+
+    local rest = {}
+    for index = 1, #full_events do
+      if full_events[index].t_ms >= target_ms then
+        rest[#rest + 1] = full_events[index]
       end
-    end,
-  })
+    end
+
+    say(string.format("seeking to %s", cli.format_time(target_ms)))
+    session = start_session(rest, target_ms)
+  end
+
+  local function handle_click(button, x, y)
+    -- 进度条行 == bar_row（写手量出来的那个），而那一行**只有**进度条，所以整行都是
+    -- 进度轴、整行可点。
+    if button ~= 1 or y ~= bar_row then
+      return
+    end
+    seek_to(cli.click_fraction(x, columns) * duration_ms)
+  end
+
+  session = start_session(events, nil)
 
   if type(session) ~= "table" then
     fail("E_PLAY", "the library did not return a playback session")
     return 1
   end
 
-  -- 驱动这首歌。run_due() 阻塞在 os.pullEvent("timer") 上，并派发每个装上的 handle，
-  -- 直到一个都不剩——也就是整首歌。进度回调就从那次派发内部触发，所以进度条仍在动。
-  clock.run_due()
+  -- 驱动这首歌：**逐事件**从时钟取事件，而不是让 run_due() 一次排空。
+  --
+  -- 为什么不用 run_due()：它内部是 `os.pullEvent("timer")`，而**带过滤**的 pullEvent 会把
+  -- 不匹配的事件从队列里丢掉（见 player/clock.lua 的 pull_once）——包括点击。结果就是
+  -- 进度条一切正常、点上去毫无反应，而且**不抛错**。pull_once 不丢弃任何事件。
+  local pump_failed = false
+  if type(session.is_playing) ~= "function" then
+    -- 没有 `is_playing` 的会话**无法**被逐事件驱动：循环条件无从判断什么时候停。旧代码用
+    -- `run_due()` 一次排空、不依赖这个字段；换成 pull_once 的泵之后它成了必需项，所以这里
+    -- 明确拒绝——否则循环一次都不执行，然后**谎报 done**。
+    fail("E_PLAY",
+      "the playback session has no is_playing(), so it cannot be pumped to completion")
+    pump_failed = true
+  else
+    while not ended and session.is_playing() do
+      local name, p1, p2, p3 = clock.pull_once()
+      if name == nil then
+        -- 一个不再产生事件的时钟会让这个循环**空转**到 CC 的看门狗（abortTimeout），看起来
+        -- 像卡死。宁可大声失败。
+        fail("E_NO_CLOCK", "the clock stopped producing events (pull_once returned nil)")
+        pump_failed = true
+        break
+      end
+      if name == "mouse_click" then
+        handle_click(p1, p2, p3)
+      end
+    end
+  end
 
-  -- 抛错过的定时器回调是被**捕获**的，不是被传播的，所以没有这一步，一次坏掉的派发会
-  -- 看起来和一首播完的歌一模一样。
-  if type(clock.errors) == "table" and #clock.errors > 0 then
-    local first = clock.errors[1]
-    local message = type(first) == "table" and first.message or tostring(first)
-    fail("E_DISPATCH", message)
+  -- **为什么这里没有「时钟提前停了」的守卫。**
+  --
+  -- 旧代码有那条守卫，因为 `run_due()` 的退出条件（时钟不再有待处理 handle）与「歌播完了」
+  -- **无关**：它排空后就返回，此时会话可能仍在播放，那个不一致就是守卫要抓的东西。
+  --
+  -- 换成逐事件泵之后，循环的**退出条件本身就是** `is_playing() == false`，两者不可能不一致
+  -- ——退出的三条路径（ended / pump_failed / is_playing 为假）里，前两条被上面的条件挡掉，
+  -- 第三条与守卫的前提直接矛盾。写在这里只会是**死代码**，而一个无法失败的检查比没有检查
+  -- 更糟，因为它看起来像检查。
+  --
+  -- 「时钟提前停」这个失效并没有消失，它换了表现形式：时钟不再派发时 `pull_once()` 会
+  -- 返回 nil（或永远阻塞），那条路径已经由上面的 `E_NO_CLOCK` 抓住。
+
+  -- 时钟没能继续供事件（上面 pump_failed）时不再往下走：这句 "done" 会是撒谎。
+  if pump_failed then
     if rt ~= nil and type(rt.cleanup) == "function" then
       pcall(rt.cleanup, speakers, session)
     end
@@ -1500,9 +1764,12 @@ function cli.run(argv, opts)
     return 1
   end
 
-  -- 如果时钟都排干了它仍报告自己在播放，说明有什么提前停了。此时说 "done." 会是撒谎。
-  if type(session.is_playing) == "function" and session.is_playing() then
-    fail("E_DISPATCH", "playback did not finish; the clock stopped early")
+  -- 抛错过的定时器回调是被**捕获**的，不是被传播的，所以没有这一步，一次坏掉的派发会
+  -- 看起来和一首播完的歌一模一样。
+  if type(clock.errors) == "table" and #clock.errors > 0 then
+    local first = clock.errors[1]
+    local message = type(first) == "table" and first.message or tostring(first)
+    fail("E_DISPATCH", message)
     if rt ~= nil and type(rt.cleanup) == "function" then
       pcall(rt.cleanup, speakers, session)
     end

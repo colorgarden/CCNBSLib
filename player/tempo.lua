@@ -170,6 +170,10 @@ Tempo.__index = Tempo
 --                 它**必须**是一个有限正数；零/NaN/无穷的间隔会立即抛出带类型的表
 --                 E_BAD_TICK_MS（对损坏输入的兜底，见文件头）。省略时，间隔从传给
 --                 play() 的事件推得（最小的正间隔）。
+--   opts.from_ms  可选。seek 锚点：把「歌曲原点」放到 from_ms 毫秒**之前**，于是
+--                 t_ms == from_ms 的事件立刻到期（见 Tempo:play）。非有限或负数一律
+--                 视为「未提供」，与缺省时逐字节相同。过滤事件是**调用方**的事
+--                 （player/plan.lua 的 opts.from_ms）；本模块只负责锚点。
 local function new(opts)
   opts = opts or {}
   local clock_obj = opts.clock
@@ -187,11 +191,19 @@ local function new(opts)
     error(bad_tick_ms("tempo.new", tick_ms), 2)
   end
 
+  -- seek 锚点。非有限或负数一律当作 0（「未提供」）——把它读成「偏移一个垃圾值」会
+  -- 静默掐掉第一个音符，而那是**不抛错**的失效。
+  local from_ms = 0
+  if is_finite_number(opts.from_ms) and opts.from_ms >= 0 then
+    from_ms = opts.from_ms
+  end
+
   local self = setmetatable({}, Tempo)
   self.clock = clock_obj
   self.warn = opts.warn
   self.on_event = opts.on_event
   self.tick_ms = tick_ms
+  self.from_ms = from_ms
   self.nominal_tick_ms = nil
   self.clamp_active = false
 
@@ -355,7 +367,13 @@ function Tempo:play(events, on_event)
 
   self.events = stable_sort_by_t(events or {})
   self.run_callback = on_event or self.on_event
-  self.start_ms = self.clock.now_ms()
+  -- seek 锚点：把「歌曲原点」放到 from_ms 毫秒之前。于是 t_ms == from_ms 的事件的
+  -- ideal = start_ms + t_ms = now，**立刻到期**，而不是先静默等 from_ms。from_ms 为 0
+  -- 时这与旧行为逐字节相同。
+  --
+  -- 符号是最容易搞反的地方：写成 now + from_ms 不会崩，只会让歌先静静等上 from_ms
+  -- 才开始出声。
+  self.start_ms = self.clock.now_ms() - self.from_ms
   self.index = 1
   self.handle = nil
   self.cancelled = false

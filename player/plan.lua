@@ -156,6 +156,22 @@ function plan.plan(song, analysis, opts)
   local out_of_range = type(opts) == "table" and opts.out_of_range
     or mapping.DEFAULT_OUT_OF_RANGE
 
+  -- opts.from_ms（seek）：只保留 t_ms >= from_ms 的事件。
+  --
+  -- **绝不改写 t_ms。** t_ms 是冻结的（t_ms = tick_index * tick_ms），seek 只做取舍、
+  -- 不做平移；平移会破坏计划的公共契约，也会破坏 Tier-2 那条「有序调用序列」断言。
+  --
+  -- 非有限或负数一律视为「未提供」（与 opts.from_ms 缺省时逐字节相同）。把它读成
+  -- 「过滤掉一切」是最容易犯的错：那会让一次误传的 from_ms 静默变成一首空歌。
+  local from_ms = nil
+  if type(opts) == "table" then
+    local candidate = opts.from_ms
+    if type(candidate) == "number" and candidate == candidate
+      and candidate ~= math.huge and candidate ~= -math.huge and candidate >= 0 then
+      from_ms = candidate
+    end
+  end
+
   -- 这首歌是否处于 SOLO 模式。**一次**算完，遍历整个图层数组，因为任何图层上的 solo
   -- 都会让所有非 solo 图层静音——所以这不可能逐音符决定。
   local any_solo = layer_format.any_solo(layers)
@@ -279,7 +295,12 @@ function plan.plan(song, analysis, opts)
       ratio = ratio,
     }
 
-    events[#events + 1] = event
+    -- from_ms 过滤发生在这里、而不是在 grouped 里：t_ms 是每个事件各自推导的，只有
+    -- 构造出 event 才知道它落在哪。分组与 note_index 都**不受**过滤影响，所以被保留
+    -- 事件的 note_index 仍与未过滤时相同。
+    if from_ms == nil or event.t_ms >= from_ms then
+      events[#events + 1] = event
+    end
   end
 
   -- 显式地强制那条冻结的全序。不要指望 `grouped` 已经是这个顺序。
