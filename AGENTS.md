@@ -72,7 +72,7 @@ Never from an API field, a cache, or memory. Measured examples:
 
 | Trusted | Reality |
 |---|---|
-| Gitea `license` API field said `None` | The repo's LICENSE file was GPL-2.0, 17,337 bytes |
+| Gitea `license` API field said `None` | The repo's LICENSE file was GPL-2.0, 17,337 bytes — and is MIT now, so the field would be a stale answer in EITHER direction |
 | `tostring(a_table):find("write")` | Can never match; reported a false failure |
 | A grep count of `setImage` = 0 | The name is generated at runtime, not absent |
 | raw CDN right after a push | Served the OLD file for ~5 min (`max-age=300`) |
@@ -298,9 +298,11 @@ done`.
   `os.exit`, `goto`. `lua tests/lint.lua` must exit 0.
   NOTE: lint does **not** check `utf8.*` — that is a convention enforced by review,
   and it exists because the desktop interpreter (stock Lua 5.2.4) lacks `utf8`.
-* **Licence: GPL-2.0, and the library contains ZERO third-party code.** There is
+* **Licence: MIT, and the library contains ZERO third-party code.** There is
   no `vendor/` any more. If you ever need a third-party library, that is a
-  decision for the user, not a vendoring detail.
+  decision for the user, not a vendoring detail. (Older releases were GPL-2.0.
+  The move to MIT was the owner's own call, made while the repository still had
+  a single author, so it is NOT a precedent for pulling in third-party code.)
 * **`tests/` is NOT published** (`.gitignore`). The suite protects the local
   developer only. If a guarantee must hold on GitHub, it cannot live only in
   `tests/`.

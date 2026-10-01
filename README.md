@@ -264,7 +264,10 @@ local shown = ccnbs.cp1252.to_display(song.header.name)
 
 ## 许可证
 
-以 **GNU 通用公共许可证第 2 版（GPL-2.0）** 发布，完整条款见 [`LICENSE`](LICENSE)。
+以 **MIT 许可证**发布，完整条款见 [`LICENSE`](LICENSE)。
 第三方组件及其归属见 [`NOTICE`](NOTICE)。
 
 本库的全部实现均为从零编写，**不含任何第三方代码**。
+
+> 早期版本曾以 GPL-2.0 发布。改为 MIT 只会更宽松、不会更严格，
+> 因此那些副本已经获得的权利不受影响。

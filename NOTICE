@@ -3,8 +3,13 @@ NOTICE
 
 CCNBSLib
 Copyright (c) 2026 colorgarden
-This project's own code is licensed under the GNU General Public License,
-version 2 (GPL-2.0, not "or later"). See LICENSE.
+This project's own code is licensed under the MIT License. See LICENSE.
+
+Earlier releases of this project were published under the GNU General Public
+License, version 2 (GPL-2.0). Relicensing is more permissive, never less, so
+anyone who obtained a copy under those terms keeps every right that licence
+granted them; those copies and their terms are part of this project's git
+history and are not withdrawn by this change.
 
 This project is an independent implementation. It is not affiliated with,
 endorsed by, or sponsored by Open Note Block Studio, Mojang, Microsoft, or the
@@ -14,7 +19,7 @@ CC:Tweaked maintainers.
 The library contains NO third-party code
 -----------------------------------------
 Everything distributed in this repository was written from scratch for this
-project and is covered by its GPL-2.0 licence:
+project and is covered by its MIT licence:
 
     ccnbslib.lua     the public entry point
     nbs/*.lua        parsing: reader, header, layers, notes, instruments,
@@ -60,8 +65,8 @@ should see where its input came from.
    Licensed under the MIT License.
    Used for: the upstream demo songs that the above fixtures are derived from.
 
-These fixtures remain under their own MIT licences and are NOT covered by this
-project's GPL-2.0.
+These fixtures remain under their own upstream MIT licences; the project's MIT
+licence above does not alter them.
 
 
 Trademarks

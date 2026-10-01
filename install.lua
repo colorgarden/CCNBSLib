@@ -1,6 +1,6 @@
--- SPDX-License-Identifier: GPL-2.0-only
+-- SPDX-License-Identifier: MIT
 -- Copyright (C) 2026 colorgarden
--- CCNBSLib 的一部分。以 GPL-2.0 授权；条款见 LICENSE。
+-- CCNBSLib 的一部分。以 MIT 授权；条款见 LICENSE。
 --
 -- install.lua
 --
