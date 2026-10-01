@@ -412,6 +412,28 @@ function ccnbs.play(song_or_plan, opts)
     return tempo_session:stats()
   end
 
+  -- session.seek(target_ms)：跳到歌曲的某一刻，**不重建会话**。
+  --
+  -- 为什么不是「取消 + 用 opts.from_ms 重开」。重开要把整首歌的 O(n) 工作再付一遍——过滤
+  -- 事件、重建路由、排序——而一次**拖动**会产生几十个鼠标事件，于是进度条卡住、松手之后
+  -- 还在消化积压。实测 8000 音符要 17ms、20000 音符要 72ms 一次。
+  --
+  -- 这里改为委托给 tempo 的重新锚定（O(log n)），**分配与路由原样复用**：它们由整首歌
+  -- 一次性算出并通过了验证，而此刻播的是那份计划的子集，所以沿用同一份逐事件路由时每个
+  -- 扬声器的负载只会小于等于全量时的负载——复用永远合法。
+  --
+  -- `fired` 必须跟着一起改：它驱动 `is_playing()` 与 `on_progress` 的位置。跳完之后
+  -- 剩下 `total - (index - 1)` 个事件，所以它应当是 `index - 1`。往回跳会让它变小，那
+  -- 是**对的**——事件确实又被播放了一次。
+  function session.seek(target_ms)
+    if session._cancelled then
+      return false
+    end
+    local index = tempo_session:seek(target_ms)
+    fired = index - 1
+    return true
+  end
+
   session._cancelled = false
 
   -- 冻结的公共会话字段。

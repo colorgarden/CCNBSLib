@@ -1605,9 +1605,6 @@ function cli.run(argv, opts)
 
   -- --- seek 支撑 ------------------------------------------------------------------
   --
-  -- 原始**完整**计划。seek 必须从它重新过滤——绝不能拿 `session.plan`（那是上一次 seek
-  -- 的子集）当基准，否则往回跳就跳不回去。
-  local full_events = events
   -- 点击映射的分母：歌曲「时长」= 最后一个事件的 t_ms（cli.duration_ms）。seek 期间
   -- **恒定不变**；若从剩余计划重算，分母会变小，点击就会漂移。
   local duration_ms = duration
@@ -1647,23 +1644,20 @@ function cli.run(argv, opts)
   end
 
   local session = nil
-  -- 跳到结尾之后循环要立刻结束。用标志而不是把 session 置 nil：收尾清理仍需要一个
-  -- **有效但已取消**的会话去停扬声器。
-  local ended = false
 
-  local function start_session(list, from_ms)
-    return lib.play(list, {
-      analysis = analysis,
-      speakers = speakers,
-      clock = clock,
-      out_of_range = out_of_range,
-      from_ms = from_ms,
-      -- 警告曾被**丢弃**。库发出裸码、并期待调用方为它措辞；一个不传任何处理器的 CLI
-      -- 会静默丢掉每一条，于是「没有警告出现」对「之前有没有出过问题」什么也说明不了。
-      on_warning = warn_to_screen,
-      on_progress = progress_handler,
-    })
-  end
+  -- 初次播放。`from_ms` **不再**需要：跳转现在是在活着的会话上重新锚定（session.seek），
+  -- 而不是取消再重开一个带 from_ms 的会话。库仍然支持 from_ms（「从第 30 秒开始播」是
+  -- 一个合法的起步位置），只是 CLI 的跳转不再走那条路。
+  session = lib.play(events, {
+    analysis = analysis,
+    speakers = speakers,
+    clock = clock,
+    out_of_range = out_of_range,
+    -- 警告曾被**丢弃**。库发出裸码、并期待调用方为它措辞；一个不传任何处理器的 CLI
+    -- 会静默丢掉每一条，于是「没有警告出现」对「之前有没有出过问题」什么也说明不了。
+    on_warning = warn_to_screen,
+    on_progress = progress_handler,
+  })
 
   local function seek_to(target_ms)
     if target_ms < 0 then
@@ -1672,41 +1666,39 @@ function cli.run(argv, opts)
     if target_ms > duration_ms then
       target_ms = duration_ms
     end
-
-    if session ~= nil and type(session.cancel) == "function" then
-      session.cancel()
+    if session ~= nil and type(session.seek) == "function" then
+      -- 在**活着的会话**上重新锚定，O(log n)。分配与路由原样复用：它们是确定性的、对整首
+      -- 歌已经算过，而此刻播的是那份计划的子集，所以每个扬声器的负载只会小于等于全量时的
+      -- 负载——复用永远合法。
+      --
+      -- 这里**不**打永久行：一次拖动会产生几十个 seek，每次一条会把屏幕滚穿。进度条本身
+      -- 就是反馈。
+      --
+      -- 跳到结尾也不需要特殊分支：把 target 定在 duration 上，seek 之后没有事件可派发，
+      -- 于是 `is_playing()` 自然变假、循环退出。旧代码那条「显式跳尾分支」是因为它走的是
+      -- 「过滤 + 重开」，而过滤 `t_ms >= duration` 会留下**一个**事件（duration 就是最后
+      -- 一个事件的 t_ms），必须靠分支才能区分「到结尾」与「播最后一个音符」。
+      session.seek(target_ms)
     end
-
-    -- **跳到结尾是一个显式分支，不能靠「过滤后为空」来实现。** 过滤是 t_ms >= from_ms，
-    -- 而 target_ms == duration_ms 恰好等于最后一个事件的 t_ms，结果含**一个**事件、不是
-    -- 空。没有这个分支，「点最右」会变成「播最后一个音符」——语义错，而且会被谎称为
-    -- 「跳到结尾」。
-    if target_ms >= duration_ms then
-      ended = true
-      return
-    end
-
-    local rest = {}
-    for index = 1, #full_events do
-      if full_events[index].t_ms >= target_ms then
-        rest[#rest + 1] = full_events[index]
-      end
-    end
-
-    say(string.format("seeking to %s", cli.format_time(target_ms)))
-    session = start_session(rest, target_ms)
   end
 
-  local function handle_click(button, x, y)
-    -- 进度条行 == bar_row（写手量出来的那个），而那一行**只有**进度条，所以整行都是
-    -- 进度轴、整行可点。
+  -- handle_mouse(name, button, x, y)：只认进度条那一行的左键，click 与 drag 都算。
+  --
+  -- **drag 必须处理。** 一次拖动 = 1 个 `mouse_click` + 几十个 `mouse_drag` + 1 个
+  -- `mouse_up`（见 tweaked.cc 的 mouse_drag/mouse_up）。原来只处理 click，所以拖动
+  -- 期间**完全没有反应**——进度条不动，松手也没有任何变化。
+  --
+  -- 现在逐事件 seek：seek 是 O(log n)，实测与歌曲规模无关，所以不需要防抖或合并。
+  local function handle_mouse(name, button, x, y)
     if button ~= 1 or y ~= bar_row then
       return
     end
+    if name ~= "mouse_click" and name ~= "mouse_drag" then
+      return
+    end
+    -- 进度条行**只有**进度条，所以整行都是进度轴、整行可点。
     seek_to(cli.click_fraction(x, columns) * duration_ms)
   end
-
-  session = start_session(events, nil)
 
   if type(session) ~= "table" then
     fail("E_PLAY", "the library did not return a playback session")
@@ -1727,7 +1719,7 @@ function cli.run(argv, opts)
       "the playback session has no is_playing(), so it cannot be pumped to completion")
     pump_failed = true
   else
-    while not ended and session.is_playing() do
+    while session.is_playing() do
       local name, p1, p2, p3 = clock.pull_once()
       if name == nil then
         -- 一个不再产生事件的时钟会让这个循环**空转**到 CC 的看门狗（abortTimeout），看起来
@@ -1736,9 +1728,11 @@ function cli.run(argv, opts)
         pump_failed = true
         break
       end
-      if name == "mouse_click" then
-        handle_click(p1, p2, p3)
+      if name == "mouse_click" or name == "mouse_drag" then
+        handle_mouse(name, p1, p2, p3)
       end
+      -- mouse_up 不需要特殊处理：seek 发生在按下与拖动的每一个位置，松手时状态已经是
+      -- 对的。刻意**不**在松手时再 seek 一次——那只会多一次无效果的重新锚定。
     end
   end
 
@@ -1748,8 +1742,8 @@ function cli.run(argv, opts)
   -- **无关**：它排空后就返回，此时会话可能仍在播放，那个不一致就是守卫要抓的东西。
   --
   -- 换成逐事件泵之后，循环的**退出条件本身就是** `is_playing() == false`，两者不可能不一致
-  -- ——退出的三条路径（ended / pump_failed / is_playing 为假）里，前两条被上面的条件挡掉，
-  -- 第三条与守卫的前提直接矛盾。写在这里只会是**死代码**，而一个无法失败的检查比没有检查
+  -- ——退出的两条路径（`pump_failed`、`is_playing()` 为假）里，前者被上面的条件挡掉，后者
+  -- 与守卫的前提直接矛盾。写在这里只会是**死代码**，而一个无法失败的检查比没有检查
   -- 更糟，因为它看起来像检查。
   --
   -- 「时钟提前停」这个失效并没有消失，它换了表现形式：时钟不再派发时 `pull_once()` 会

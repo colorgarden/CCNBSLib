@@ -415,6 +415,64 @@ function Tempo:cancel()
   self.handle = nil
 end
 
+-- t:seek(target_ms) -> integer（新的起始下标）
+--
+-- 播放**中途**改变起点，不重建任何东西。CLI 的跳转原本是「取消 + 用 opts.from_ms 重开
+-- 一个会话」，那要把整首歌的 O(n) 工作再付一遍：过滤事件、重建路由、排序（而 plan 本来
+-- 就已经按 t_ms 排好了）。实测 8000 音符一次 seek 要 17ms、20000 音符 72ms，而一次拖动
+-- 会产生几十个鼠标事件——于是进度条卡住，松手之后还在慢慢消化积压。
+--
+-- seek 只做三件事，O(log n)：
+--   1. 二分找到第一个 `t_ms >= target_ms` 的下标（events 按 t_ms 非递减，这是 plan 的
+--      冻结全序保证的）；
+--   2. 重新锚定 `start_ms = now - target_ms`——与 opts.from_ms 用的是同一个机制，所以
+--      `t_ms == target_ms` 的事件**立刻**到期；
+--   3. 取消旧 timer、am`_schedule_next` 重排一个。
+--
+-- **分配与路由原样复用。** 它们由整首歌一次性算出、并且已经验证过（每个扬声器在任意
+-- 50ms 窗口内不超过上限）。此刻播的是那份计划的**子集**，沿用同一份逐事件路由时，每个
+-- 扬声器的负载只会**小于等于**全量时的负载——所以复用永远合法，不需要重算。
+--
+-- 指标（metrics）**不**清零：它记录的是这次运行真实发生过的事，往回跳并不会让它变成假话。
+-- 指标里可能因此出现同一个事件被记两次（重放），那是真的——它确实被派发了两次。
+function Tempo:seek(target_ms)
+  local target = tonumber(target_ms) or 0
+  if target < 0 then
+    target = 0
+  end
+
+  -- 二分开头：第一个 t_ms >= target 的下标。找不到就是 #events + 1（没有东西可派发了）。
+  local low, high = 1, #self.events + 1
+  while low < high do
+    local middle = math.floor((low + high) / 2)
+    local event = self.events[middle]
+    if event ~= nil and event.t_ms >= target then
+      high = middle
+    else
+      low = middle + 1
+    end
+  end
+
+  -- 取消在途的那个 timer。**这一步不能省**：不取消的话，为旧起点武装的那个截止时间
+  -- 仍会触发，把 seek 之前的事件派发出去。
+  if self.handle ~= nil and self.clock.cancel ~= nil then
+    self.clock.cancel(self.handle)
+  end
+  self.handle = nil
+  self.cancelled = false
+
+  self.start_ms = self.clock.now_ms() - target
+  self.index = low
+  if self.index > #self.events then
+    -- 跳到结尾之后：没有东西可派发，也没有 timer 要排。调用方看到的下标大于事件数，
+    -- 而 `_schedule_next` 会立刻返回。
+    return self.index
+  end
+
+  self:_schedule_next()
+  return self.index
+end
+
 -- t:stats() -> table
 --
 -- 当前（或最近一次）运行的实时指标。`clamped_ticks` 统计的是歌曲**标称** tick 间隔

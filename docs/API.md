@@ -107,12 +107,34 @@ ccnbs.play(events, { analysis = analysis })   -- 播放已编排好的计划
 
 ## 跳转进度
 
-`opts.from_ms` 让播放**从指定的毫秒数开始**——也就是跳转（seek）。
+有两个入口，用在不同时刻：
 
-### 播歌曲：库帮你过滤
+| 场景 | 用什么 |
+| --- | --- |
+| **播放开始之前**决定从哪儿起（例如「从第 30 秒开始」） | `opts.from_ms` |
+| **播放期间**随时跳（进度条点击/拖动） | `session.seek(ms)` |
+
+### `session.seek(target_ms)`——播放中跳转
 
 ```text
-ccnbs.play(song, { from_ms = 30 * 1000 })   -- 从第 30 秒开始
+local session = ccnbs.play(song, { speakers = speakers, clock = clock })
+
+session.seek(30 * 1000)   -- 跳到第 30 秒，立刻生效
+```
+
+**不重建会话**：分配与路由原样复用（它们对整首歌已经算过、也已经验证过；此刻播的是那份
+计划的子集，所以每个扬声器的负载只会小于等于全量时的负载）。开销是 O(log n)——实测与歌曲
+规模**无关**：8000 音符与 20000 音符都是约 0.005 ms。所以可以每个鼠标事件都调一次，拖动
+进度条是流畅的。
+
+- 往回跳会**重放**已经播过的事件（事件确实又被播放了一次，`session.stats()` 也会如实记录）。
+- 跳到结尾或之后：没有事件可派发，`session.is_playing()` 变成 `false`，会话自然结束。
+- 已经 `session.cancel()` 过的会话，`seek` 返回 `false` 且什么也不做。
+
+### `opts.from_ms`——播放开始时就位
+
+```text
+ccnbs.play(song, { from_ms = 30 * 1000 })   -- 一开播就在第 30 秒
 ```
 
 `plan` 会丢掉所有 `t_ms` 早于 `from_ms` 的事件，于是 `from_ms` 处（或之后最近的）那个
@@ -150,6 +172,7 @@ E_PLAN_BEFORE_FROM
 | --- | --- |
 | `session.cancel()` | 停止播放；幂等 |
 | `session.is_playing()` | 是否仍在播放（取消后为 `false`） |
+| `session.seek(target_ms)` | 播放中跳到某一刻；不重建会话，见〈跳转进度〉 |
 | `session.analysis` | 本次分析结果 |
 | `session.plan` | 本次事件数组 |
 | `session.assignment` | 扇出分配结果（含 `warning_args`） |
