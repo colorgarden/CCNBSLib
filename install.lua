@@ -128,15 +128,22 @@ end
 -- interactive path that was never exercised is exactly how the autorun bug survived
 -- (written, never run, silently wrong). Returns nil when there is no way to read,
 -- which every caller treats as "the user said nothing".
-local function read_seam(prompt)
+--
+-- NO ARGUMENTS TO `read`. Its first parameter is a REPLACE CHARACTER for hiding a
+-- password -- `read([replaceChar [, history [, completeFn [, default]]]])` -- and it
+-- keeps only that string's first character. Calling it as
+-- `read("number (blank to cancel): ")` therefore showed NO prompt and echoed every
+-- keystroke as the letter "n". There is no prompt parameter; the prompt is WRITTEN
+-- first (the same bug was in nbsplay.lua).
+local function read_seam()
   if type(seams.read) == "function" then
-    return seams.read(prompt)
+    return seams.read()
   end
   local reader = raw_global("read")
   if type(reader) ~= "function" then
     return nil
   end
-  local ok, answer = pcall(reader, prompt)
+  local ok, answer = pcall(reader)
   if not ok then
     return nil
   end
@@ -224,6 +231,18 @@ local function make_writer()
       end
       term.write(tostring(text))
       advance()
+    end,
+    -- A PROMPT: written where the cursor is, and the cursor is LEFT there, because the
+    -- user types on this line and `read` echoes from the current position.
+    --
+    -- This exists because `read` takes NO prompt argument -- its first parameter is a
+    -- replace character, for hiding a password -- so the prompt has to be written here.
+    prompt = function(text)
+      if live then
+        term.clearLine()
+        live = false
+      end
+      term.write(tostring(text))
     end,
     refresh = function(text)
       local _, row = term.getCursorPos()
@@ -758,7 +777,10 @@ local function select_mirror(mirrors, out, opts)
     prompt = "number (blank to cancel): "
   end
 
-  local answer = read_seam(prompt)
+  -- WRITE THE PROMPT, THEN READ. There is no prompt argument to `read` -- its first
+  -- parameter is a replace character -- so writing it here is the only way it appears.
+  out.prompt(prompt)
+  local answer = read_seam()
 
   if type(answer) ~= "string" then
     -- No way to read: not an error, just nothing to ask.
@@ -1008,7 +1030,11 @@ function installer.run(argv, opts)
   end
   local out = make_writer()
   if type(opts.write) == "function" then
-    out = { line = opts.write, refresh = opts.write }
+    out = {
+      line = opts.write,
+      refresh = opts.write,
+      prompt = opts.write,
+    }
   end
 
   local log = function(text)

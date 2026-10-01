@@ -214,7 +214,7 @@ end
 -- ANY NON-ANSWER FALLS BACK TO SHIFT, which is the library's own default. A blank
 -- line, unreadable input, or a typo must not abort a playback the user asked for --
 -- the same reasoning the installer's mirror menu uses.
-function cli.choose_out_of_range(opts, probe, say, emit)
+function cli.choose_out_of_range(opts, probe, say, emit, prompt)
   local min_key, max_key = native_bounds()
 
   emit("")
@@ -232,7 +232,16 @@ function cli.choose_out_of_range(opts, probe, say, emit)
   end
   emit("")
 
-  local answer = read_seam(opts, "choose 1-4 (blank = shift): ")
+  -- THE PROMPT IS WRITTEN BY US, and `read` is called bare.
+  --
+  -- `read`'s first parameter is a replace character, not a prompt, so the old
+  -- `read("choose 1-4 (blank = shift): ")` displayed NO prompt and echoed each
+  -- keystroke as the letter "c" -- the first character of that string. Two visible
+  -- symptoms, one cause.
+  if type(prompt) == "function" then
+    prompt("choose 1-4 (blank = shift): ")
+  end
+  local answer = read_seam(opts)
   if type(answer) ~= "string" then
     say("nothing was read, so shift is used")
     return "shift"
@@ -672,15 +681,24 @@ end
 -- never exercised is how the autorun bug survived -- written, never run, silently
 -- wrong. Returns nil when there is no way to read, which callers treat as "said
 -- nothing".
-read_seam = function(opts, prompt)
+read_seam = function(opts)
   if type(opts) == "table" and type(opts.read) == "function" then
-    return opts.read(prompt)
+    return opts.read()
   end
   local reader = raw_global("read")
   if type(reader) ~= "function" then
     return nil
   end
-  local ok, answer = pcall(reader, prompt)
+  -- NO ARGUMENTS. `read`'s first parameter is a REPLACE CHARACTER (for hiding a
+  -- password), not a prompt -- `read([replaceChar [, history [, completeFn
+  -- [, default]]]])` -- and it keeps only that string's first character. Called as
+  -- `read("choose 1-4: ")` it therefore rendered nothing at all and echoed every
+  -- keystroke as the letter "c", which is the "why does typing 1 show a c" bug.
+  --
+  -- There is no prompt parameter to pass. The prompt must be WRITTEN first, which is
+  -- what `prompt` on the writer is for, and what CC's own documentation does:
+  -- `write("> "); local msg = read()`.
+  local ok, answer = pcall(reader)
   if not ok then
     return nil
   end
@@ -783,6 +801,9 @@ local function make_writer()
     return {
       line = plain,
       wrapped = plain,
+      -- No cursor control, so there is no line to type on; `plain` is the least wrong
+      -- answer and this branch has no interactive reader anyway.
+      prompt = plain,
       refresh = function() end,
     }
   end
@@ -854,6 +875,19 @@ local function make_writer()
       for index = 1, #lines do
         write_line(lines[index])
       end
+    end,
+    -- A PROMPT: written where the cursor is, and the cursor is LEFT there, because the
+    -- user types on this line and `read` echoes from the current position. Advancing
+    -- would put the answer on the following line and leave the prompt stranded.
+    --
+    -- This exists because `read` takes no prompt argument -- see read_seam -- so the
+    -- prompt has to be written by us.
+    prompt = function(text)
+      if live then
+        term.clearLine()
+        live = false
+      end
+      term.write(tostring(text))
     end,
     refresh = function(text)
       local _, row = term.getCursorPos()
@@ -1228,7 +1262,12 @@ function cli.run(argv, opts)
   if type(opts.write) == "function" then
     -- A single injected sink receives BOTH kinds, so a test sees exactly the
     -- ordered sequence the terminal would: refreshes included.
-    out = { line = opts.write, refresh = opts.write, wrapped = opts.write }
+    out = {
+      line = opts.write,
+      refresh = opts.write,
+      wrapped = opts.write,
+      prompt = opts.write,
+    }
   end
   local lib = library()
   local rt = runtime_module()
@@ -1322,7 +1361,8 @@ function cli.run(argv, opts)
       out_of_range = policy
       say("out-of-range notes: " .. policy)
     else
-      out_of_range = cli.choose_out_of_range(opts, probe, say, out.wrapped)
+      out_of_range = cli.choose_out_of_range(opts, probe, say, out.wrapped,
+      out.prompt)
     end
   end
 
