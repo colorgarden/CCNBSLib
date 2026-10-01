@@ -286,7 +286,12 @@ function ccnbs.play(song_or_plan, opts)
 
   -- 在冻结的事件序上做确定性扇出。`assignment` 是调用方可见的记录；`by_speaker`
   -- 让我们按身份把每个事件路由出去。
-  local assignment = fanout_module.assign(events, analysis, speakers)
+  --
+  -- `opts.on_assign(done, total)` 可选：把分配进度透给调用方。这是一次**同步**的
+  -- O(事件数 × 扬声器数) 扫描，夹在「策略已选」与「第一声响起」之间，实测 8000 音符约
+  -- 66ms、20000 音符约 177ms（桌面 Lua，真机的 Cobalt 更慢）——调用方拿它画一条进度条，
+  -- 那段停顿才不像卡死。
+  local assignment = fanout_module.assign(events, analysis, speakers, opts.on_assign)
 
   -- 加载期属性优先：扩展音域在任何一个事件触发之前就已知，所以它不能等到播放中途。
   if analysis.has_extended_range then

@@ -163,9 +163,29 @@ end
 -- allocate(events, speakers) -> owner，其中 owner[i] 是事件 i 被分配到的扬声器记录；
 -- 当一个消耗容量的事件被丢掉时为 nil。自定义/未知事件只要至少有一个扬声器就分配给
 -- speakers[1]。纯的、完备的、确定性的；从不抛错。
-local function allocate(events, speakers)
+local function allocate(events, speakers, on_progress)
   local total_events = #events
   local total_speakers = #speakers
+
+  -- 进度上报：按事件数，每 **1/64 的进度或每 256 个事件**报一次（两者取更早的那个）。
+  --
+  -- 为什么要节流：这个回调是从分配循环内部**同步**调用的，而调用方很可能在回调里直接画
+  -- 屏幕。逐事件上报会把一次分配变成几万次 term.write，反而把停顿拉长——而这条进度条的
+  -- 全部意义就是让那段时间不显得像卡死。
+  --
+  -- 为什么要按比例而不是固定事件数：一首 200 事件的歌与一首 20000 事件的歌要用同一个间隔，
+  -- 就得让间隔随规模走。两者取更早的那个，于是小歌也有几次上报、大歌不会太稀。
+  local report = type(on_progress) == "function" and on_progress or nil
+  local report_step = nil
+  if report ~= nil then
+    report_step = math.floor(total_events / 64)
+    if report_step > 256 then
+      report_step = 256
+    end
+    if report_step < 1 then
+      report_step = 1
+    end
+  end
 
   -- 逐扬声器的滑动窗口记账，按扬声器在数组里的位置索引，所以哈希表遍历永远碰不到它。
   --   times[k]   扬声器 k 各条目的起始时间（ms），按分配顺序
@@ -386,6 +406,12 @@ local function allocate(events, speakers)
   end
 
   for i = 1, total_events do
+    -- 节流上报。放在循环**开头**，所以 done 是「已经开始处理多少个」，而循环走完后下面
+    -- 还会**无条件**补报一次 total——不补的话最后一次会被节流吞掉，进度条永远差最后一格。
+    if report ~= nil and (i % report_step == 1) then
+      report(i - 1, total_events)
+    end
+
     local event = events[i]
     local kind = nil
     if type(event) == "table" then
@@ -443,12 +469,31 @@ local function allocate(events, speakers)
     end
   end
 
+  -- 无条件补报一次 total：节流会吞掉最后一次，没有这一下进度条永远差最后一格，而那段
+  -- 「99% 卡住」看起来比不显示进度更像出了问题。
+  if report ~= nil then
+    report(total_events, total_events)
+  end
+
   return owner
 end
 
 -- fanout.assign(events, analysis, speakers) -> assignment。纯的、完备的、确定性的：
 -- 它只读自己的输入，且从不为了顺序而使用 `pairs`。
-function fanout.assign(events, analysis, speakers)
+-- fanout.assign(events, analysis, speakers, on_progress) -> assignment
+--
+-- `on_progress(done, total)` 可选，**按事件数**上报。调用方拿它画一条进度条。
+--
+-- 为什么需要它。菜单选完之后、第一声响起之前，这里有一段**同步**的停顿：把整首歌的每个
+-- 事件分配到某个扬声器。开销是 O(事件数 × 扬声器数)，实测 8000 音符 / 4 扬声器约 66ms、
+-- 20000 音符 / 8 扬声器约 177ms——而那是**桌面 Lua**，真机上的 Cobalt 会明显更慢，正好是
+-- 用户能感知到的「卡了一下」。
+--
+-- 与 decode 的进度同一种机制：这里也是同步阻塞的，调用方回不到自己的循环，所以进度只能由
+-- 本函数在干活的过程中回调。**不能**沿用播放期那套定时重画——那一刻时钟根本不会被拉动。
+--
+-- 只读输入，回调也**不**影响分配结果：它是纯粹的旁路观察，加不加、抛不抛错都不改变 owner。
+function fanout.assign(events, analysis, speakers, on_progress)
   if type(events) ~= "table" then
     events = {}
   end
@@ -459,7 +504,7 @@ function fanout.assign(events, analysis, speakers)
     analysis = {}
   end
 
-  local owner = allocate(events, speakers)
+  local owner = allocate(events, speakers, on_progress)
 
   -- 预先为每个 side 建好键，好让调用方按扬声器 side 索引时不必判 nil，包括那些没有
   -- 任何事件的 side。

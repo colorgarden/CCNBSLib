@@ -594,6 +594,34 @@ function cli.bar_row(frac, columns)
   return "[" .. cli.render_bar(frac, width - 2) .. "]"
 end
 
+-- cli.playback_position(base_ms, anchor_ms, now_ms, duration_ms) -> number
+--
+-- 播放位置（毫秒）= 锚点位置 + 从锚点起流逝的时间，夹在 [0, duration_ms] 之内。
+--
+-- **为什么需要它。** 进度条与时间原来只在 `on_progress` 里更新，而那个回调是**事件驱动**
+-- 的——只有派发一个音符时才触发。于是长音或休止（几秒没有事件）期间，进度条与时间**完全
+-- 不动**，然后在下一个音符处猛地跳一格；看起来就像它们「和 note 进度绑定」。位置改由
+-- **时钟**推导之后，刷新频率就与音符密度无关了。
+--
+-- 锚点在播放开始或一次 seek 时设定，所以同一个公式覆盖了两种情况。
+--
+-- 纯函数，所以这段算术不需要终端、时钟或歌曲就能钉住。
+function cli.playback_position(base_ms, anchor_ms, now_ms, duration_ms)
+  local base = tonumber(base_ms) or 0
+  local anchor = tonumber(anchor_ms) or 0
+  local now = tonumber(now_ms) or 0
+  local duration = tonumber(duration_ms) or 0
+
+  local position = base + (now - anchor)
+  if position < 0 then
+    position = 0
+  end
+  if duration > 0 and position > duration then
+    position = duration
+  end
+  return position
+end
+
 -- cli.click_fraction(x, columns) -> 0..1
 --
 -- 把点击的**列号**映射成进度。进度条占满整行（见 cli.bar_row），所以列号本身**就是**
@@ -1453,7 +1481,29 @@ function cli.run(argv, opts)
   end
 
   say("decoding")
-  local decoded = lib.decode(body)
+  -- **解码期只能靠这个回调画。** 与播放期不同：decode 是**同步阻塞**的，它跑的时候泵回不到
+  -- 循环里，时钟定时器根本不会被拉动——播放期那套「定时重画」在这里是死的。唯一能做事的
+  -- 时机，就是 decode 自己回调的时候。
+  --
+  -- 按**百分比变化**节流重画：库每 4096 字节报一次，一首 8 MB 的歌就是约两千次回调，逐次
+  -- 重画等于把 term.write 变成解码之外的第二大开销。百分比是屏幕上唯一会变的东西，所以
+  -- 「变了才画」既省又看不出差别。
+  local last_decode_percent = -1
+  local decoded = lib.decode(body, function(done, total)
+    local percent = 0
+    if type(done) == "number" and type(total) == "number" and total > 0 then
+      percent = math.floor(done / total * 100)
+      if percent < 0 then percent = 0 end
+      if percent > 100 then percent = 100 end
+    end
+    if percent == last_decode_percent then
+      return
+    end
+    last_decode_percent = percent
+    live(
+      string.format("decoding  %d%%", percent),
+      cli.bar_row(percent / 100, columns))
+  end)
   if type(decoded) ~= "table" or decoded.ok ~= true then
     local code = type(decoded) == "table" and decoded.error
       and decoded.error.code or "unknown"
@@ -1626,6 +1676,11 @@ function cli.run(argv, opts)
     return 1
   end
 
+  -- 定时重画用的是**未包装**的时钟。--debug 会把时钟包一层，而包装器把每一次 after /
+  -- now_ms 都记进调试日志；刷新是每秒 20 次的常规动作，逐条记进去只会把真正的时序线索
+  -- 淹掉。这与进度回调的限流是同一个考虑。
+  local refresh_clock = clock
+
   if debug then
     log("--- instrumenting the clock; playback follows ---")
     clock = instrument_clock(clock, log)
@@ -1650,28 +1705,93 @@ function cli.run(argv, opts)
     say("warning: " .. cli.describe_warning(code, args))
   end
 
-  local progress_logged = 0
-  -- 提成命名函数：seek 会**重开会话**，而重开时要把同一个进度回调再传进去。
-  local function progress_handler(info)
-    local elapsed = tonumber(info.t_ms) or 0
-    local frac = duration_ms > 0 and (elapsed / duration_ms) or 0
+  -- --- 播放位置：按**时钟**推进，不按音符 --------------------------------------------
+  --
+  -- 两行实时区原来只在 `on_progress` 里更新，而那个回调是**事件驱动**的：只有派发一个音符
+  -- 时才触发。于是长音或休止期间进度条与时间**完全不动**，然后在下一个音符处猛地跳一格。
+  -- 位置改为从时钟推导——锚点位置 + 从锚点起流逝的时间——刷新频率就与音符密度无关了。
+  local position_base_ms = 0
+  local last_note_index = 0
+  local last_note_total = #events
+
+  -- 时钟缺席时返回 0，而不是抛错：注入的测试时钟未必实现 now_ms，而「位置恒为锚点」是
+  -- 那些测试本来就会看到的行为。
+  local function clock_now()
+    if type(refresh_clock.now_ms) == "function" then
+      local ok, value = pcall(refresh_clock.now_ms)
+      if ok and type(value) == "number" then
+        return value
+      end
+    end
+    return 0
+  end
+
+  -- 播放锚点：**出声那一刻**的时钟读数。`now - anchor` 就是从开播到现在流逝的歌曲时间。
+  --
+  -- **必须由 lib.play 之后的代码重新取一次**（见下面 `session = lib.play(...)` 之后）。
+  -- lib.play 内部会同步跑完扬声器分配，真机上那是几百毫秒；若锚点在那之前就取下，这整段
+  -- preparing 都会被算成播放进度——进度条在第一个音符响之前就已经跑了一截。
+  -- 实测：模拟 900ms 的分配，首帧显示 `playing 90%`，而歌一个音符都还没播。
+  --
+  -- 初值只是占位：`lib.play` 之前不会有人调用 current_position_ms（preparing 期间画的是
+  -- assign_handler 自己的百分比）。
+  local anchor_at_ms = clock_now()
+
+  local function current_position_ms()
+    return cli.playback_position(position_base_ms, anchor_at_ms,
+      clock_now(), duration_ms)
+  end
+
+  local function draw_playback(position_ms)
+    local frac = duration_ms > 0 and (position_ms / duration_ms) or 0
     -- 信息量最大的在前：先是百分比与时钟，然后是音符计数。装不下的那个才被丢掉。
     live(
       string.format("playing  %d%%  %s/%s  note %d/%d",
         math.floor(frac * 100),
-        cli.format_time(elapsed), cli.format_time(duration_ms),
-        tonumber(info.index) or 0, tonumber(info.total) or 0),
+        cli.format_time(position_ms), cli.format_time(duration_ms),
+        last_note_index, last_note_total),
       cli.bar_row(frac, columns))
+  end
+
+  local progress_logged = 0
+  local function progress_handler(info)
+    -- 音符计数只能从事件得知（那是事件侧的事实，时间推不出来），所以记下来供两次事件之间
+    -- 的重画使用。而**时间轴由时钟推导**，不用 info.t_ms 画进度条——用它会立刻把进度条
+    -- 绑回音符密度，也就是这次要修的那个问题。
+    last_note_index = tonumber(info.index) or last_note_index
+    last_note_total = tonumber(info.total) or last_note_total
+    draw_playback(current_position_ms())
     -- 限流：21247 次回调会把日志淹掉。
     progress_logged = progress_logged + 1
     if progress_logged <= 10 or progress_logged % 200 == 0 then
       log(string.format("progress %d/%s  t_ms=%s (%s)",
         tonumber(info.index) or 0, tostring(info.total), tostring(info.t_ms),
-        cli.format_time(elapsed)))
+        cli.format_time(tonumber(info.t_ms) or 0)))
     end
   end
 
   local session = nil
+
+  -- 分配扬声器期间的进度：菜单选完之后、第一声响起之前的那段同步停顿。
+  --
+  -- 与解码进度同一个道理：`fanout.assign` 是同步阻塞的，那一刻回不到泵循环、时钟也不会被
+  -- 拉动，所以只能靠它自己的回调用最朴素的方式画。按**百分比变化**节流，理由与解码相同。
+  local last_assign_percent = -1
+  local function assign_handler(done, total)
+    if type(done) ~= "number" or type(total) ~= "number" or total <= 0 then
+      return
+    end
+    local percent = math.floor(done / total * 100)
+    if percent < 0 then percent = 0 end
+    if percent > 100 then percent = 100 end
+    if percent == last_assign_percent then
+      return
+    end
+    last_assign_percent = percent
+    live(
+      string.format("preparing  %d%%", percent),
+      cli.bar_row(percent / 100, columns))
+  end
 
   -- 初次播放。`from_ms` **不再**需要：跳转现在是在活着的会话上重新锚定（session.seek），
   -- 而不是取消再重开一个带 from_ms 的会话。库仍然支持 from_ms（「从第 30 秒开始播」是
@@ -1685,7 +1805,14 @@ function cli.run(argv, opts)
     -- 会静默丢掉每一条，于是「没有警告出现」对「之前有没有出过问题」什么也说明不了。
     on_warning = warn_to_screen,
     on_progress = progress_handler,
+    -- 分配扬声器的进度。见上面的 assign_handler。
+    on_assign = assign_handler,
   })
+
+  -- **现在**才取播放锚点。上面那次 lib.play 里同步跑完了扬声器分配（真机上几百毫秒），
+  -- 而歌是从它返回之后才开始响的。早取一毫秒，那段 preparing 就多被算进播放进度一毫秒；
+  -- 早取几百毫秒，进度条在第一个音符之前就凭空跑掉一大截。
+  anchor_at_ms = clock_now()
 
   local function seek_to(target_ms)
     if target_ms < 0 then
@@ -1707,6 +1834,14 @@ function cli.run(argv, opts)
       -- 「过滤 + 重开」，而过滤 `t_ms >= duration` 会留下**一个**事件（duration 就是最后
       -- 一个事件的 t_ms），必须靠分支才能区分「到结尾」与「播最后一个音符」。
       session.seek(target_ms)
+
+      -- **重设锚点**：目标时刻就是「现在」这一刻的歌曲位置。不重设的话，跳转后位置仍从旧
+      -- 锚点推算，进度条会立刻跳回原处。
+      position_base_ms = target_ms
+      anchor_at_ms = clock_now()
+
+      -- 立刻重画，不等下一个事件。跳到一段没有音符的地方时，否则进度条要过好几秒才跟上。
+      draw_playback(target_ms)
     end
   end
 
@@ -1732,6 +1867,45 @@ function cli.run(argv, opts)
     fail("E_PLAY", "the library did not return a playback session")
     return 1
   end
+
+  -- --- 定时重画 ----------------------------------------------------------------------
+  --
+  -- **这是「进度条与时间不动」的正解。** 只靠 `on_progress` 不行：事件只在与音符相关的时刻
+  -- 到达，长音或休止期间一个都没有，那两行就会僵住。所以另外按**固定间隔**重画一次，位置
+  -- 从时钟推导。
+  --
+  -- 50 ms 是 CC 定时器的粒度下限（`os.startTimer` 取整到 0.05 s），也是游戏 tick 的长度，
+  -- 所以它是能画得最密的间隔；再密没有意义，再疏会出现肉眼可见的停顿。
+  local REFRESH_SECONDS = 0.05
+  local refresh_handle = nil
+  local playback_over = false
+
+  local function stop_refresh()
+    playback_over = true
+    if refresh_handle ~= nil and type(refresh_clock.cancel) == "function" then
+      refresh_clock.cancel(refresh_handle)
+    end
+    refresh_handle = nil
+  end
+
+  -- 自我重排：每次触发后重画一次再排下一个，直到播放结束。
+  local function arm_refresh()
+    if playback_over or type(refresh_clock.after) ~= "function" then
+      return
+    end
+    refresh_handle = refresh_clock.after(REFRESH_SECONDS, function()
+      refresh_handle = nil
+      if playback_over then
+        return
+      end
+      draw_playback(current_position_ms())
+      arm_refresh()
+    end)
+  end
+
+  -- 先画一帧：时钟没有 after（注入的测试时钟可能没有）时，这一步保证屏幕上至少不是空的。
+  draw_playback(current_position_ms())
+  arm_refresh()
 
   -- 驱动这首歌：**逐事件**从时钟取事件，而不是让 run_due() 一次排空。
   --
@@ -1763,6 +1937,10 @@ function cli.run(argv, opts)
       -- 对的。刻意**不**在松手时再 seek 一次——那只会多一次无效果的重新锚定。
     end
   end
+
+  -- 停止定时重画：否则一个已经结束的播放会继续每秒排 20 个定时器，而屏幕上那两行早已
+  -- 没有意义。也顺带避免把 handle 留在时钟里。
+  stop_refresh()
 
   -- **为什么这里没有「时钟提前停了」的守卫。**
   --

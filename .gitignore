@@ -34,6 +34,11 @@ venv/
 # Lua test scratch output.
 # ---------------------------------------------------------------------------
 *.tmp
+# `luac -l file.lua` WRITES this next to itself, and `luac -s` would too. It is a
+# by-product of the disassembly proof used to show a change touched comments only,
+# so it appears without anyone asking for it -- and it has twice been copied to the
+# real machine by the sync script. Ignored here so it can never be committed either.
+luac.out
 
 # ---------------------------------------------------------------------------
 # 本地测试套件：仅保留在本机，不随公开仓库发布。

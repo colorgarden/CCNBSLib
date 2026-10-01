@@ -20,6 +20,7 @@ local ccnbs = require("ccnbslib")
 | 调用 | 返回 |
 | --- | --- |
 | `ccnbs.decode(bytes)` | 与 `nbs.decode.decode` 完全相同的结构：成功 `{ok=true, song=...}`，失败 `{ok=false, error={code=...}}` |
+| `ccnbs.decode(bytes, on_progress)` | 同上，并**边解码边上报进度**：`on_progress(done, total)`，单位是**字节**。见〈解码进度〉 |
 | `ccnbs.analyze(song, opts)` | 与 `nbs.analyze.analyze` 完全相同的结构 |
 | `ccnbs.plan(song, analysis, opts)` | 事件数组（冻结全序 `(tick_index, layer_index, note_index)`） |
 | `ccnbs.play(song\|plan, opts)` | 一个**会话** `session`，立即返回、不阻塞（第一个参数可以是歌曲表，也可以是已编排好的事件数组） |
@@ -68,6 +69,7 @@ Minecraft 客户端播放音效时会把音高夹到 `0.5..2.0`，所以**一份
 | `opts.clock` | 新建的 `player.clock.new_os()` | 计时来源；可注入虚拟时钟 |
 | `opts.on_warning` | 无 | `function(code, args)`，每个不同的**裸**代码至多回调一次 |
 | `opts.on_progress` | 无 | `function(info)`，`info = {t_ms, index, total}` |
+| `opts.on_assign` | 无 | `function(done, total)`，**分配扬声器的进度**（按事件数）。见〈分配进度〉 |
 | `opts.on_event` | 无 | `function(event)`，每个到期事件在**派发之前**回调 |
 | `opts.out_of_range` | `"shift"` | 越界音符怎么处理，见上文〈超出音域的音符〉 |
 | `opts.from_ms` | `0` | **从哪里开始播**（毫秒）。播歌曲时会过滤掉更早的事件；播**计划**时该计划必须已过滤，否则抛 `E_PLAN_BEFORE_FROM`。见〈跳转进度〉 |
@@ -104,6 +106,53 @@ ccnbs.play(events, { analysis = analysis })   -- 播放已编排好的计划
 省略 `opts.analysis` 时会抛出类型化错误 `E_PLAN_REQUIRES_ANALYSIS`（错误信息点名
 `opts.analysis`），而**不是**一个 nil 算术崩溃。播放歌曲与播放其计划的行为
 **完全一致**：相同的警告、相同的分配、相同的调用序列。
+
+## 解码进度
+
+`decode` 是**同步阻塞**的：整首歌一次解完，期间调用方什么都做不了。对大文件那就是一段可
+感知的「读完了但屏幕没反应」的停顿。可选的第二个参数让你在这段时间里画一条进度条：
+
+```text
+local decoded = ccnbs.decode(bytes, function(done, total)
+  print(string.format("decoding %d%%", math.floor(done / total * 100)))
+end)
+```
+
+- `done` / `total` 是**字节偏移**与输入总长度。用字节而不是音符数，是因为音符总数在扫完
+  之前未知（跳转编码只能顺序走），拿它做分母会得到一个跳来跳去的百分比。
+- `done` 单调递增，**最后一次恰好等于 `total`**，所以进度条一定画到 100%。
+- 回调是**同步**的：它从解析循环内部被调用。在里面画屏幕是合法的，但**别做重活**——它会
+  直接拖慢解码本身。`nbsplay` 的做法是只在百分比变化时才重画。
+- 传 `nil`、或不传，行为与以前**完全一样**。非函数值会被忽略，不会抛错。
+
+> **注意**：进度来自音符分节，那是解码里唯一随文件增长的部分。所以百分比会在开头很快
+> 跳到某个值，然后平滑走完——这是真实的分布，不是缺陷。
+
+## 分配进度
+
+`play` 在真正出声之前要先做一次**扬声器分配**：决定每个事件由哪个扬声器发出。这是一次
+**同步**扫描，开销 O(事件数 × 扬声器数)——实测 8000 音符约 66 ms、20000 音符约 177 ms
+（桌面 Lua；CC:Tweaked 的 Cobalt 解释器更慢）。对一首大歌，这就是「选完播放模式之后卡了
+一下」的那一下。
+
+可选的 `opts.on_assign(done, total)` 让调用方在这段时间里画进度：
+
+```text
+ccnbs.play(song, {
+  on_assign = function(done, total)
+    print(string.format("preparing %d%%", math.floor(done / total * 100)))
+  end,
+})
+```
+
+- 单位是**事件数**：`done` 单调递增，**最后一次恰好等于 `total`**。
+- 回调是**同步**的，从分配循环内部被调用。在里面画屏幕是合法的，但**别做重活**。
+- 它**不改变分配结果**——纯粹是旁路观察。传 `nil`、不传、或传非函数值，行为与以前完全
+  一样，声音也不会变。
+- 大歌才看得见：几百个音符的歌会在几毫秒内走完，进度条一闪而过。
+
+> 与〈解码进度〉是**同一种机制**（同步阻塞 → 只能靠回调），与播放期的 `on_progress`
+> **不同**（那里由时钟定时重画驱动）。
 
 ## 跳转进度
 

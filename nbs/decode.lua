@@ -95,7 +95,19 @@ local function normalize_error(err)
 end
 
 -- decode(bytes) -> { ok = true, song = ... } | { ok = false, error = ... }
-function decode.decode(bytes)
+-- decode(bytes, on_progress) -> 同上
+--
+-- `on_progress(done, total)` 可选。**按字节偏移**上报，`total` 恒为输入长度，`done` 单调
+-- 递增、且最后一次就是全文件。作用是让调用方在大文件上能画一条进度条，而不是干等。
+--
+-- 它是**可选**的，而且非函数值会被忽略（不是报错）：解码是库的公共入口，多一个可选参数
+-- 不应该让任何一个现有调用方开始抛错。
+--
+-- 上报来自音符分节——那是解码里唯一随文件增长的部分；header / layers / 自定义乐器都只看
+-- 文件的一小段。所以进度会在音符分节开始时突然前进，然后平滑走完——这是真实的分布，不是
+-- 缺陷。
+function decode.decode(bytes, on_progress)
+  local report = type(on_progress) == "function" and on_progress or nil
   if type(bytes) ~= "string" then
     return internal_error("decode expects a byte string, got " .. type(bytes))
   end
@@ -125,7 +137,7 @@ function decode.decode(bytes)
   -- pcall 抓住它们并透传。
   local ok, composed = pcall(function()
     local parsed_header = header.parse(r)
-    local parsed_notes = notes.parse(r, parsed_header.version)
+    local parsed_notes = notes.parse(r, parsed_header.version, report)
     local parsed_layers = layers.parse(r, parsed_header.version,
       parsed_header.layer_count)
     local parsed_custom =
@@ -142,6 +154,13 @@ function decode.decode(bytes)
 
   if not ok then
     return { ok = false, error = normalize_error(composed) }
+  end
+
+  -- 整个文件读完，报一次 100%。音符分节之后还有 layers 与自定义乐器，所以音符分节最后
+  -- 那次上报**到不了**文件末尾（实测差 7 字节）。没有这一下，调用方的进度条会停在离 100%
+  -- 差一点的地方——「看起来快好了，其实早完了」，比不画进度条更让人困惑。
+  if report ~= nil then
+    report(length, length)
   end
 
   -- 组合后的合理性检查：必须消耗掉一个有效 header，且游标绝不能越过缓冲末尾。
