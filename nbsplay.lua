@@ -594,6 +594,34 @@ function cli.bar_row(frac, columns)
   return "[" .. cli.render_bar(frac, width - 2) .. "]"
 end
 
+-- 暂停按钮的两段文案，画在**进度条底下那一行的行首**。
+--
+-- 纯 ASCII 且都以 `[` 开头：按钮占几列必须等于 `#label`，点击命中区域才与看到的东西
+-- 对齐——中文按 1 列算会错位、按 2 列算会让命中宽度与字符串长度说的不是一回事
+-- （cli.display_width 就是为这种场合存在的，但按钮不需要那份复杂度）。
+cli.PAUSE_LABEL = "[Pause]"
+cli.RESUME_LABEL = "[Resume]"
+
+-- cli.button_label(paused) -> 当前该画的按钮文案。
+function cli.button_label(paused)
+  if paused then
+    return cli.RESUME_LABEL
+  end
+  return cli.PAUSE_LABEL
+end
+
+-- cli.hits_button(x, paused) -> 列号 x 是否落在按钮上。
+--
+-- 按钮只占行首那几列；同一行其余部分是空白，点了必须**什么都不发生**——把整行都
+-- 当成按钮会让「点了一下按钮右边」变成暂停，而屏幕上那里什么都没有。
+function cli.hits_button(x, paused)
+  local column = tonumber(x)
+  if column == nil or column < 1 then
+    return false
+  end
+  return column <= #cli.button_label(paused)
+end
+
 -- cli.playback_position(base_ms, anchor_ms, now_ms, duration_ms) -> number
 --
 -- 播放位置（毫秒）= 锚点位置 + 从锚点起流逝的时间，夹在 [0, duration_ms] 之内。
@@ -835,17 +863,20 @@ local function make_writer()
       prompt = plain,
       refresh = function() end,
       refresh_bar = function() end,
+      refresh_button = function() end,
     }
   end
 
-  -- 两条**实时行**固定在屏幕底部，日志区收缩到它们上方：
+  -- 三条**实时行**固定在屏幕底部，日志区收缩到它们上方：
   --
-  --     info_row   = height - 1   信息行（百分比、时间、音符计数）
-  --     bar_row    = height       进度条，**独占一行**
-  --     log_bottom = height - 2   永久行只能落在 1..log_bottom
+  --     info_row    = height - 2   信息行（百分比、时间、音符计数）
+  --     bar_row     = height - 1   进度条，**独占一行**
+  --     button_row  = height       暂停按钮，行首（只在播放期间画）
+  --     log_bottom  = height - 3   永久行只能落在 1..log_bottom
   --
   -- 进度条独自占一整行，所以整行就是进度轴：第 1 列 = 0%、最后一列 = 100%。点击映射
-  -- 因此不需要知道进度条的几何——见 cli.click_fraction。
+  -- 因此不需要知道进度条的几何——见 cli.click_fraction。按钮单独占下面一行，点它与点
+  -- 进度条是两件事，靠行号区分。
   local height = 19
   if type(term.getSize) == "function" then
     local ok, _, measured = pcall(term.getSize)
@@ -853,14 +884,18 @@ local function make_writer()
       height = measured
     end
   end
-  local bar_row = height
-  local info_row = height - 1
-  local log_bottom = height - 2
+  local button_row = height
+  local bar_row = height - 1
+  local info_row = height - 2
+  local log_bottom = height - 3
   if log_bottom < 1 then
     log_bottom = 1
   end
   if info_row < 1 then
     info_row = 1
+  end
+  if bar_row < 1 then
+    bar_row = 1
   end
 
   -- 第一条永久行写在哪（1 起算）；大于 log_bottom 表示「需要先滚动」。
@@ -909,7 +944,7 @@ local function make_writer()
     term.setCursorPos(1, row)
   end
 
-  -- 清掉两条实时行。**必须在任何滚动之前调用**：`term.scroll(1)` 会把整屏内容上移一行，
+  -- 清掉三条实时行。**必须在任何滚动之前调用**：`term.scroll(1)` 会把整屏内容上移一行，
   -- 若不清，进度条的残影会被带到 info_row 上面去。清掉之后，下一次 refresh 会把它们
   -- 重画回来。
   local function clear_live()
@@ -920,6 +955,10 @@ local function make_writer()
     term.clearLine()
     if bar_row ~= info_row then
       term.setCursorPos(1, bar_row)
+      term.clearLine()
+    end
+    if button_row ~= info_row and button_row ~= bar_row then
+      term.setCursorPos(1, button_row)
       term.clearLine()
     end
     live = false
@@ -996,7 +1035,7 @@ local function make_writer()
       -- 用户的回答会占用这一行，所以下一条永久行要写到它下面一行。
       log_row = row + 1
     end,
-    -- 信息行（height - 1）。进度百分比、时间与音符计数都在这里。
+    -- 信息行（height - 2）。进度百分比、时间与音符计数都在这里。
     refresh = function(text)
       live = true
       term.setCursorPos(1, info_row)
@@ -1004,7 +1043,7 @@ local function make_writer()
       term.write(tostring(text))
       park_cursor()
     end,
-    -- 进度条行（height）。**独占一行、整行都是进度轴**，所以点击任意一列都能直接映射成
+    -- 进度条行（height - 1）。**独占一行、整行都是进度轴**，所以点击任意一列都能直接映射成
     -- 进度——这就是 cli.click_fraction 只用列号的原因。文本由 cli.bar_row 生成，宽度恰好
     -- 等于终端列数。
     refresh_bar = function(text)
@@ -1014,6 +1053,16 @@ local function make_writer()
       term.write(tostring(text))
       park_cursor()
     end,
+    -- 暂停按钮行（height，最底下一行）。只有行首那几列是按钮（见 cli.hits_button），
+    -- 所以画的是标签本身、不是一条填满整行的东西。
+    refresh_button = function(text)
+      live = true
+      term.setCursorPos(1, button_row)
+      term.clearLine()
+      term.write(tostring(text))
+      park_cursor()
+    end,
+    button_row = button_row,
   }
 end
 
@@ -1405,16 +1454,21 @@ function cli.run(argv, opts)
       line = opts.write,
       refresh = opts.write,
       refresh_bar = opts.write,
+      -- 暂停按钮也走同一个接收器：注入写手的测试正是靠它看到 [Pause]/[Resume]
+      -- 的先后顺序，而没有这一项，按钮就成了不可观测的行为。
+      refresh_button = opts.write,
       wrapped = opts.write,
       prompt = opts.write,
     }
   end
 
-  -- 进度条的行号与终端列数。**优先用写手量出来的值**：进度条就是按那个行号、那个宽度
-  -- 画出来的，点击映射必须与画出来的东西完全对应。只有在没有写手几何时（测试注入的
-  -- 接收器）才自己量一次。
+  -- 进度条与按钮的行号、终端列数。**优先用写手量出来的值**：进度条与按钮就是按那些
+  -- 行号画出来的，点击映射必须与画出来的东西完全对应。只有在没有写手几何时（测试注入的
+  -- 接收器）才自己量一次——那时的行号是按同一套几何（bar = height-1、button = height）
+  -- 推出来的，好让注入接收器那条路测到与生产路径相同的映射。
   local columns = tonumber(out.columns)
   local bar_row = tonumber(out.bar_row)
+  local button_row = tonumber(out.button_row)
   if columns == nil or bar_row == nil then
     local measured_columns, measured_height = 51, 19
     local term_geom = terminal()
@@ -1433,7 +1487,10 @@ function cli.run(argv, opts)
       columns = measured_columns
     end
     if bar_row == nil then
-      bar_row = measured_height
+      bar_row = measured_height > 1 and (measured_height - 1) or 1
+    end
+    if button_row == nil then
+      button_row = measured_height
     end
   end
   local lib = library()
@@ -1752,6 +1809,15 @@ function cli.run(argv, opts)
   local last_note_index = 0
   local last_note_total = #events
 
+  -- 暂停状态。`paused_position_ms` 是**暂停那一刻**（或暂停中点进度条所指）的歌曲
+  -- 位置；只要暂停着，显示的位置就冻结在它上面，与时钟走了多远无关。
+  --
+  -- `paused` 还兼着一件事：暂停时会话被推到歌尾，`is_playing()` 随之变假——若泵循环
+  -- 只看它，暂停就等于退出。循环条件写的是 `is_playing() or paused`，所以暂停期间
+  -- 泵照转、按钮照点，恢复时再 seek 回来。
+  local paused = false
+  local paused_position_ms = 0
+
   -- 时钟缺席时返回 0，而不是抛错：注入的测试时钟未必实现 now_ms，而「位置恒为锚点」是
   -- 那些测试本来就会看到的行为。
   local function clock_now()
@@ -1776,6 +1842,10 @@ function cli.run(argv, opts)
   local anchor_at_ms = clock_now()
 
   local function current_position_ms()
+    -- 暂停中位置是**冻结**的：时钟照走，但显示不许动，否则暂停按钮亮着而时间还在爬。
+    if paused then
+      return paused_position_ms
+    end
     return cli.playback_position(position_base_ms, anchor_at_ms,
       clock_now(), duration_ms)
   end
@@ -1789,6 +1859,9 @@ function cli.run(argv, opts)
         cli.format_time(position_ms), cli.format_time(duration_ms),
         last_note_index, last_note_total),
       cli.bar_row(frac, columns))
+    -- 按钮跟着每一帧重画：写永久行会滚动屏幕并清掉实时行，只在切换状态时画一次的话，
+    -- 按钮会在下一次滚动后凭空消失。文案由 `paused` 决定，所以「谁画的」不重要。
+    out.refresh_button(cli.button_label(paused))
   end
 
   local progress_logged = 0
@@ -1863,6 +1936,16 @@ function cli.run(argv, opts)
     if target_ms > duration_ms then
       target_ms = duration_ms
     end
+
+    -- 暂停中：只移动**显示**的位置。session.seek 会把定时器重新挂上，音符就会在暂停
+    -- 期间响起来；真正的 seek 推迟到恢复那一刻（toggle_pause 的恢复分支），目标位置
+    -- 记在 paused_position_ms 里。
+    if paused then
+      paused_position_ms = target_ms
+      draw_playback(target_ms)
+      return
+    end
+
     if session ~= nil and type(session.seek) == "function" then
       -- 在**活着的会话**上重新锚定，O(log n)。分配与路由原样复用：它们是确定性的、对整首
       -- 歌已经算过，而此刻播的是那份计划的子集，所以每个扬声器的负载只会小于等于全量时的
@@ -1887,7 +1970,41 @@ function cli.run(argv, opts)
     end
   end
 
-  -- handle_mouse(name, button, x, y)：只认进度条那一行的左键，click 与 drag 都算。
+  -- toggle_pause()：暂停 / 恢复。按钮在进度条**底下那一行的行首**，见 handle_mouse。
+  --
+  -- **暂停不重建会话。** 取消再重开要把整首歌的分配再跑一遍（真机上 46764 音符是几秒
+  -- 级），而暂停/恢复会被反复点。这里只用已冻结的会话 API：
+  --
+  --   暂停   session.seek(duration + 1) 会话推到**最后一个事件之后** —— tempo 撤掉
+  --                                       挂起的定时器、没有事件可发，于是一个音都不响。
+  --                                       is_playing() 随之变假，由 `paused` 兜住泵循环。
+  --
+  -- **为什么是 duration + 1 而不是 duration。** tempo:seek 二分找的是第一个
+  -- `t_ms >= target` 的事件（tempo_spec case 28：seek(100) 会重放 100 那个事件），而
+  -- duration 恰恰就是最后一个事件的 t_ms——seek(duration) 会把最后一个音符**重新装上
+  -- 膛**，delay 0 立刻派发：暂停瞬间计数跳成「总数/总数」，还多响一个音（用户实测
+  -- 报的就是这个）。加 1 之后二分落到 #events + 1，什么都没剩。
+  --
+  --   恢复   session.seek(位置)          重新锚定、从暂停处继续；O(log n)，与点进度条
+  --                                       跳转是同一条路，分配与路由原样复用。
+  local function toggle_pause()
+    if not paused then
+      paused_position_ms = current_position_ms()
+      paused = true
+      session.seek(duration_ms + 1)
+      log(string.format("paused at %s ms", tostring(paused_position_ms)))
+    else
+      paused = false
+      position_base_ms = paused_position_ms
+      anchor_at_ms = clock_now()
+      session.seek(paused_position_ms)
+      log(string.format("resumed at %s ms", tostring(paused_position_ms)))
+    end
+    -- 两种状态都要重画：信息行的时间要冻结/继续，按钮文案要从 [Pause] 换到 [Resume]。
+    draw_playback(current_position_ms())
+  end
+
+  -- handle_mouse(name, button, x, y)：进度条行负责 seek，按钮行负责暂停，其余行不算。
   --
   -- **drag 必须处理。** 一次拖动 = 1 个 `mouse_click` + 几十个 `mouse_drag` + 1 个
   -- `mouse_up`（见 tweaked.cc 的 mouse_drag/mouse_up）。原来只处理 click，所以拖动
@@ -1895,10 +2012,23 @@ function cli.run(argv, opts)
   --
   -- 现在逐事件 seek：seek 是 O(log n)，实测与歌曲规模无关，所以不需要防抖或合并。
   local function handle_mouse(name, button, x, y)
-    if button ~= 1 or y ~= bar_row then
+    if button ~= 1 then
       return
     end
     if name ~= "mouse_click" and name ~= "mouse_drag" then
+      return
+    end
+
+    -- 按钮行：只有行首那段列是按钮，行里其余部分什么都没有，点了必须没反应。拖动也不
+    -- 算——那是进度条的动作，暂停只由一次干净的点击触发。
+    if y == button_row then
+      if name == "mouse_click" and cli.hits_button(x, paused) then
+        toggle_pause()
+      end
+      return
+    end
+
+    if y ~= bar_row then
       return
     end
     -- 进度条行**只有**进度条，所以整行都是进度轴、整行可点。
@@ -1963,7 +2093,9 @@ function cli.run(argv, opts)
       "the playback session has no is_playing(), so it cannot be pumped to completion")
     pump_failed = true
   else
-    while session.is_playing() do
+    while session.is_playing() or paused do
+      -- `or paused`：暂停时会话被推到歌尾，is_playing() 是假的——只看它，暂停就等于
+      -- 退出并打印 done。暂停期间泵必须继续转，否则按钮再也点不动、恢复无从发生。
       local name, p1, p2, p3 = clock.pull_once()
       if name == nil then
         -- 一个不再产生事件的时钟会让这个循环**空转**到 CC 的看门狗（abortTimeout），看起来
