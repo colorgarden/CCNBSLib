@@ -9,10 +9,10 @@ file nbs/header.lua 11551
 file nbs/instrument_table.lua 8878
 file nbs/instruments_custom.lua 4865
 file nbs/layers.lua 8605
-file nbs/notes.lua 7603
+file nbs/notes.lua 8722
 file nbs/reader.lua 6688
 file nbs/speakers.lua 5977
-file nbsplay.lua 84830
+file nbsplay.lua 94210
 file player/clock.lua 17192
 file player/dispatch.lua 14828
 file player/fanout.lua 27640
