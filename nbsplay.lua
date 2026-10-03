@@ -1356,6 +1356,35 @@ local function check_clock_health(clock, log)
     return true, nil, nil
   end
 
+-- cli.breathe(opts) —— 在同步长工作期间把控制权还给 CC 的调度器。
+--
+-- 为什么非有不可：CC:Tweaked 会杀掉任何**连续运行超过 `timeout`（默认 7 秒）而没有
+-- 让出**的协程，报 `Too long without yielding`。`decode` 与 `fanout.assign` 都是同步
+-- 调用——它们跑的时候回不到泵循环、时钟也不被拉动——所以唯一能让出的时机就是它们
+-- **自己的进度回调**。真机实测：46764 个音符 × 117 个扬声器的压测曲死在分配的 61%
+-- （`player/fanout.lua:263`）。
+--
+-- `os.sleep(0)` 让出一次（0 秒的定时器下一个调度周期就到期，不等游戏 tick），于是
+-- 「两次让出之间」的工作量从「整段同步扫描」变成「两次回调之间」：桌面实测那是 5910
+-- 字节的解码或 256 个事件的分配，真机上零点几秒，远在 7 秒之内。
+--
+-- 让出期间队列里的事件可能被 sleep 消费掉（它是带过滤的拉取），但这两个阶段本来就没
+-- 有泵在读事件，唯一会被吃掉的是一次尚未处理的点击——而把「下载/分配期间的点击」当
+-- 成跳转本来就是错的。`terminate` 不受过滤影响，Ctrl+T 在这里照常中止。
+--
+-- 桌面版 Lua 没有 `os.sleep`，于是默认路径安静地什么都不做；`opts.breathe` 是测试
+-- 用来**数**让出次数的接缝——没有它，「让出过」这件事在测试里是不可观测的。
+function cli.breathe(opts)
+  if type(opts) == "table" and type(opts.breathe) == "function" then
+    opts.breathe()
+    return
+  end
+  local os_table = raw_global("os")
+  if type(os_table) == "table" and type(os_table.sleep) == "function" then
+    os_table.sleep(0)
+  end
+end
+
 -- ---------------------------------------------------------------------------
 -- run(argv, opts) -> 退出码
 -- ---------------------------------------------------------------------------
@@ -1490,6 +1519,9 @@ function cli.run(argv, opts)
   -- 「变了才画」既省又看不出差别。
   local last_decode_percent = -1
   local decoded = lib.decode(body, function(done, total)
+    -- **先让出，再谈画不画。** 见 cli.breathe：这一行必须在下面的百分比节流**之前**，
+    -- 否则百分比没变的那些回调（真歌里占多数）就不再让出，看门狗照样会杀过来。
+    cli.breathe(opts)
     local percent = 0
     if type(done) == "number" and type(total) == "number" and total > 0 then
       percent = math.floor(done / total * 100)
@@ -1538,6 +1570,12 @@ function cli.run(argv, opts)
   -- 策略在编排**之前**就定下来，因为它决定事件的 kind、进而决定扬声器需求——之后再选
   -- 就会按错误的成本去规划扇出。
   local analysis = lib.analyze(song, { out_of_range = out_of_range })
+
+  -- plan 是解码之后**最大**的一段同步工作（46764 音符实测 0.399 s 桌面、真机约 3 倍
+  -- 以上），而它自己没有进度回调——唯一能在它之前重置看门狗计时的地方就是这里。少了
+  -- 这一下，「解码最后一次让出 → 分配第一次让出」会连成一段（探测 + 两次 analyze +
+  -- plan，真机最坏约 6 秒），下一个更大的文件就会死在 plan 里而分配还没开始。
+  cli.breathe(opts)
   local events = lib.plan(song, analysis, { out_of_range = out_of_range })
   local duration = cli.duration_ms(events)
 
@@ -1778,6 +1816,10 @@ function cli.run(argv, opts)
   -- 拉动，所以只能靠它自己的回调用最朴素的方式画。按**百分比变化**节流，理由与解码相同。
   local last_assign_percent = -1
   local function assign_handler(done, total)
+    -- **先让出，再谈画不画。** 与解码进度同一行注释的那份理由，而且这里更致命：
+    -- fanout.assign 是整条流水线里最长的一段同步扫描（桌面 3.835 s / 真机 3~10 倍），
+    -- 不让出就一定越过 7 秒的看门狗。放节流之后 = 真歌里大多数回调不再让出。
+    cli.breathe(opts)
     if type(done) ~= "number" or type(total) ~= "number" or total <= 0 then
       return
     end
